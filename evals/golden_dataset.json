@@ -1,0 +1,18 @@
+[
+  {
+    "query_id": "eval_001",
+    "category": "factual_extraction",
+    "question": "How does adding jitter prevent the thundering herd problem during service retries?",
+    "expected_abstain": false,
+    "expected_citations": ["vid_72x_14:32"],
+    "ground_truth_answer": "Adding randomness (jitter) to backoff intervals spreads out client retry requests over time instead of having all failed clients hit the server simultaneously."
+  },
+  {
+    "query_id": "eval_002",
+    "category": "adversarial_abstention",
+    "question": "What database engine did the speaker recommend for storing biometric fingerprint data?",
+    "expected_abstain": true,
+    "expected_citations": [],
+    "ground_truth_answer": null
+  }
+]

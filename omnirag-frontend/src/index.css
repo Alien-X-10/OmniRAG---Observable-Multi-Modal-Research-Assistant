@@ -1,0 +1,29 @@
+/* File: omnirag-frontend/src/index.css */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-midnight-950 text-gray-100 font-sans antialiased selection:bg-neon-500/30 selection:text-neon-400 overflow-hidden;
+  }
+}
+
+/* Subtle dark scrollbars for the chat & sidebar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #060c09;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #12211a;
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #10b981;
+}

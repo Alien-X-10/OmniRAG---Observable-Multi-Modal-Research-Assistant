@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OmniRAG - FAANG RAG Console</title>
+  <style>
+    body { font-family: system-ui, sans-serif; background: #0f172a; color: #f8fafc; margin: 0; display: flex; height: 100vh; }
+    .sidebar { width: 350px; background: #1e293b; padding: 20px; border-right: 1px solid #334155; overflow-y: auto; }
+    .main { flex: 1; display: flex; flex-direction: column; padding: 20px; }
+    .chat-box { flex: 1; background: #1e293b; border-radius: 8px; padding: 20px; margin-bottom: 20px; overflow-y: auto; font-size: 1.1em; line-height: 1.6; white-space: pre-wrap; }
+    .input-group { display: flex; gap: 10px; }
+    input { flex: 1; padding: 15px; border-radius: 8px; border: 1px solid #334155; background: #0f172a; color: white; font-size: 1em; }
+    button { padding: 15px 30px; border-radius: 8px; border: none; background: #3b82f6; color: white; font-weight: bold; cursor: pointer; }
+    button:hover { background: #2563eb; }
+    .metric-card { background: #0f172a; padding: 15px; border-radius: 8px; margin-bottom: 10px; border: 1px solid #334155; }
+    .metric-title { font-size: 0.8em; color: #94a3b8; text-transform: uppercase; letter-spacing: 1px; }
+    .metric-value { font-size: 1.5em; font-weight: bold; margin-top: 5px; color: #38bdf8; }
+    .citation { background: #0284c7; padding: 2px 6px; border-radius: 4px; font-size: 0.8em; font-family: monospace; }
+  </style>
+</head>
+<body>
+
+  <!-- Observability Sidebar -->
+  <div class="sidebar">
+    <h2 style="margin-top: 0; color: #e2e8f0;">Telemetry Dashboard</h2>
+    
+    <div class="metric-card">
+      <div class="metric-title">Avg TTFT (Time-To-First-Token)</div>
+      <div class="metric-value" id="dash-ttft">-- ms</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-title">Total Tokens Consumed</div>
+      <div class="metric-value" id="dash-tokens">--</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-title">Cost Incurred (USD)</div>
+      <div class="metric-value" id="dash-cost">$0.000000</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-title">Tokens Saved (Compaction)</div>
+      <div class="metric-value" id="dash-saved">--</div>
+    </div>
+    
+    <h3 style="color: #94a3b8; font-size: 0.9em; margin-top: 30px;">LATEST REQUEST</h3>
+    <pre id="latest-trace" style="font-size: 0.75em; color: #a5b4fc; overflow-x: hidden;"></pre>
+  </div>
+
+  <!-- Chat / Generation Area -->
+  <div class="main">
+    <div class="chat-box" id="chat-box">System ready. Enter a query to begin grounded generation...</div>
+    <div class="input-group">
+      <input type="text" id="query-input" placeholder="e.g., How does adding jitter prevent the thundering herd problem?" autocomplete="off" />
+      <button id="send-btn" onclick="sendQuery()">Generate</button>
+    </div>
+  </div>
+
+  <script>
+    const chatBox = document.getElementById('chat-box');
+    const queryInput = document.getElementById('query-input');
+    const sendBtn = document.getElementById('send-btn');
+
+    // Poller to update the telemetry sidebar
+    async function refreshDashboard() {
+      try {
+        const res = await fetch('/api/telemetry/summary');
+        const data = await res.json();
+        
+        document.getElementById('dash-ttft').innerText = `${data.avg_ttft_ms} ms`;
+        document.getElementById('dash-tokens').innerText = data.total_tokens_consumed.toLocaleString();
+        document.getElementById('dash-cost').innerText = `$${data.cumulative_cost_usd.toFixed(6)}`;
+        document.getElementById('dash-saved').innerText = data.total_tokens_saved_by_compaction.toLocaleString();
+        
+        if (data.recent_traces.length > 0) {
+          document.getElementById('latest-trace').innerText = JSON.stringify(data.recent_traces[0].latency_ms, null, 2);
+        }
+      } catch (e) {
+        console.error('Telemetry fetch failed', e);
+      }
+    }
+
+    // Call once on load
+    refreshDashboard();
+
+    // SSE POST Streamer
+    async function sendQuery() {
+      const query = queryInput.value.trim();
+      if (!query) return;
+
+      queryInput.value = '';
+      sendBtn.disabled = true;
+      chatBox.innerHTML = '<span style="color:#94a3b8">Retrieving context & generating...</span>';
+
+      try {
+        const response = await fetch('/api/query/stream', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query, topK: 5 })
+        });
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder('utf-8');
+        let done = false;
+        
+        // Clear box before stream starts
+        chatBox.innerHTML = '';
+        let streamedAnswer = '';
+
+        while (!done) {
+          const { value, done: readerDone } = await reader.read();
+          done = readerDone;
+          if (value) {
+            const chunkText = decoder.decode(value, { stream: true });
+            const lines = chunkText.split('\n');
+            
+            for (let i = 0; i < lines.length; i++) {
+              if (lines[i].startsWith('data: ')) {
+                const dataStr = lines[i].substring(6);
+                if (!dataStr) continue;
+                
+                const data = JSON.parse(dataStr);
+
+                // Handle standard delta chunks
+                if (data.chunk) {
+                  streamedAnswer += data.chunk;
+                  
+                  // Regex to make citations look nice in UI
+                  let displayHtml = streamedAnswer.replace(
+                    /<chunk id="([^"]+)">/g, 
+                    '<span class="citation">[$1]</span>'
+                  );
+                  chatBox.innerHTML = displayHtml;
+                }
+
+                // Handle completion
+                if (data.output) {
+                  if (data.output.is_abstained) {
+                    chatBox.innerHTML = '<span style="color:#f87171">System Abstained: The answer is not present in the ingested YouTube corpus.</span>';
+                  }
+                  refreshDashboard(); // Refresh metrics instantly after query finishes
+                }
+                
+                // Handle errors
+                if (data.message) {
+                  chatBox.innerHTML = `<span style="color:#f87171">Error: ${data.message}</span>`;
+                }
+              }
+            }
+          }
+        }
+      } catch (err) {
+        chatBox.innerHTML = `<span style="color:#f87171">Network Error: ${err.message}</span>`;
+      } finally {
+        sendBtn.disabled = false;
+        queryInput.focus();
+      }
+    }
+
+    queryInput.addEventListener('keypress', (e) => {
+      if (e.key === 'Enter') sendQuery();
+    });
+  </script>
+</body>
+</html>
