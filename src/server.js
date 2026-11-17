@@ -1,6 +1,7 @@
 // File: src/server.js
 import crypto from 'node:crypto';
 import express from 'express';
+import multer from 'multer';
 import dotenv from 'dotenv';
 import { generateGroundedAnswer } from './generation/generator.js';
 import {
@@ -10,6 +11,7 @@ import {
 } from './middleware/telemetry.js';
 import { connectDB, closeDB, getChunksCollection } from './config/db.js';
 import { ingestVideo } from './ingestion/ytIngest.js';
+import { ingestPdf } from './ingestion/pdfIngest.js';
 import { registerUser, loginUser, requireAuth } from './services/auth.js';
 
 dotenv.config({ quiet: true });
@@ -18,27 +20,64 @@ export const app = express();
 app.use(express.json());
 app.use(telemetryMiddleware);
 
+// Configure Multer in-memory upload (up to 25 MB PDFs)
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 25 * 1024 * 1024 },
+});
+
 app.use(express.static('public'));
 app.get('/', (req, res) => res.sendFile('index.html', { root: 'public' }));
 
 /**
- * UI Endpoint for YouTube Ingestion
- * Returns the actual extracted title, videoId, and chunk count.
+ * 1A. UI Endpoint for YouTube Ingestion (User-Scoped)
  */
-app.post('/api/ingest', async (req, res) => {
+app.post('/api/ingest', requireAuth, async (req, res) => {
   try {
     const { videoUrl } = req.body || {};
     if (!videoUrl) {
       return res.status(400).json({ error: 'videoUrl is required' });
     }
 
-    const result = await ingestVideo({ videoUrl, useMock: false });
+    const userId = String(req.user.userId);
+    const result = await ingestVideo({ videoUrl, useMock: false, userId });
 
     return res.json({
       status: 'ok',
       video_id: result.videoId,
       title: `${result.title} (${result.chunksCount} chunks)`,
       chunks_count: result.chunksCount,
+      chunksCount: result.chunksCount,
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * 1B. UI Endpoint for Multi-Modal PDF & Slide-Deck Ingestion (User-Scoped)
+ */
+app.post('/api/ingest/pdf', requireAuth, upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file || !req.file.buffer) {
+      return res.status(400).json({ error: 'A PDF file is required.' });
+    }
+
+    const userId = String(req.user.userId);
+    const result = await ingestPdf({
+      fileBuffer: req.file.buffer,
+      originalName: req.file.originalname || 'Document.pdf',
+      customTitle: req.body?.title || null,
+      useMock: false,
+      userId,
+    });
+
+    return res.json({
+      status: 'ok',
+      video_id: result.videoId,
+      title: result.title,
+      chunks_count: result.chunksCount,
+      chunksCount: result.chunksCount,
     });
   } catch (err) {
     return res.status(500).json({ error: err.message });
@@ -54,7 +93,7 @@ function sendSseEvent(res, eventName, dataPayload) {
 }
 
 /**
- * 1. Health & Readiness Endpoint
+ * 2. Health & Readiness Endpoint
  */
 app.get('/health', (req, res) => {
   res.status(200).json({
@@ -66,7 +105,7 @@ app.get('/health', (req, res) => {
 });
 
 /**
- * 2. SSE Grounded Generation Endpoint
+ * 3. SSE Grounded Generation Endpoint (User-Scoped Retrieval & Telemetry)
  */
 app.post('/api/query/stream', requireAuth, async (req, res) => {
   const { query, topK = 5 } = req.body || {};
@@ -81,17 +120,19 @@ app.post('/api/query/stream', requireAuth, async (req, res) => {
   res.flushHeaders();
 
   const requestId = req.requestId || crypto.randomUUID();
+  const userId = req.user?.userId ? String(req.user.userId) : null;
   sendSseEvent(res, 'meta', { request_id: requestId, status: 'streaming_started' });
 
   try {
     const result = await generateGroundedAnswer(query.trim(), {
       topK,
+      userId,
       onStreamDelta: (chunk) => sendSseEvent(res, 'delta', { chunk }),
     });
 
     const savedTrace = await recordQueryTelemetry({
       requestId,
-      userId: req.user?.userId || null,
+      userId,
       userEmail: req.user?.email || null,
       query: query.trim(),
       output: result.output,
@@ -112,7 +153,7 @@ app.post('/api/query/stream', requireAuth, async (req, res) => {
 });
 
 /**
- * 3. Observability Dashboard Endpoint
+ * 4. Observability Dashboard Endpoint
  */
 app.get('/api/telemetry/summary', requireAuth, async (req, res) => {
   try {
@@ -125,16 +166,19 @@ app.get('/api/telemetry/summary', requireAuth, async (req, res) => {
 });
 
 /**
- * 4. GET /api/resources
- * Aggregates all ingested YouTube videos in video_chunks by video_id,
- * sorted with the newest ingested/updated video at the very top.
+ * 5. GET /api/resources
+ * Lists ONLY the authenticated user's ingested YouTube videos and PDFs,
+ * sorted with the newest ingested/updated item at the very top.
  */
 app.get('/api/resources', requireAuth, async (req, res) => {
   try {
     res.setHeader('Cache-Control', 'no-store');
+    const userId = String(req.user.userId);
     const collection = await getChunksCollection();
+
     const videos = await collection
       .aggregate([
+        { $match: { user_id: userId } },
         {
           $group: {
             _id: '$video_metadata.video_id',
@@ -156,14 +200,17 @@ app.get('/api/resources', requireAuth, async (req, res) => {
 });
 
 /**
- * 5. DELETE /api/resources/:videoId
- * Removes all chunks for a specific video_id from MongoDB.
+ * 6. DELETE /api/resources/:videoId
+ * Removes ONLY the authenticated user's chunks for a specific video_id or pdf docId.
  */
 app.delete('/api/resources/:videoId', requireAuth, async (req, res) => {
   try {
     const { videoId } = req.params;
+    const userId = String(req.user.userId);
     const collection = await getChunksCollection();
+
     const result = await collection.deleteMany({
+      user_id: userId,
       'video_metadata.video_id': videoId,
     });
 
@@ -178,7 +225,7 @@ app.delete('/api/resources/:videoId', requireAuth, async (req, res) => {
 });
 
 /**
- * 6. POST /api/auth/register
+ * 7. POST /api/auth/register
  */
 app.post('/api/auth/register', async (req, res) => {
   try {
@@ -198,7 +245,7 @@ app.post('/api/auth/register', async (req, res) => {
 });
 
 /**
- * 7. POST /api/auth/login
+ * 8. POST /api/auth/login
  */
 app.post('/api/auth/login', async (req, res) => {
   try {

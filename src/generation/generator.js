@@ -29,7 +29,7 @@ STRICT GROUNDING & CITATION RULES:
 1. Every factual claim in your "answer" MUST include an inline citation tag formatted strictly as <chunk id="CHUNK_ID"> (e.g., <chunk id="vid_72x_14:32">).
 2. Every chunk you cite in "answer" MUST also be included in the "citations" array with its exact chunk_id, video_id, and timestamp taken from the <chunk> attributes.
 3. Do NOT extrapolate, guess, or use outside knowledge.
-3. CRITICAL RULE: You MUST include the exact citation tag (e.g., <chunk id="vid_...">) at the end of any sentence that uses information from the context. If a chunk is in your citations array, its exact tag MUST appear in your answer text.
+4. CRITICAL RULE: You MUST include the exact citation tag (e.g., <chunk id="vid_...">) at the end of any sentence that uses information from the context. If a chunk is in your citations array, its exact tag MUST appear in your answer text.
 5. ABSTENTION PATH: If the provided <chunk> blocks are empty or do not explicitly contain the factual answer to the user's question, you MUST set "is_abstained": true, "answer": null, and "citations": [].`;
 
 /**
@@ -47,16 +47,17 @@ function calculateCostUsd(promptTokens, candidateTokens) {
  * @param {string} query - The user's technical question
  * @param {object} options
  * @param {number} [options.topK=5] - Number of RRF candidates to retrieve
+ * @param {string|null} [options.userId=null] - Authenticated user ID for corpus isolation
  * @param {function} [options.onStreamDelta] - Optional callback invoked on each streamed JSON chunk (used for SSE)
  */
 export async function generateGroundedAnswer(
   query,
-  { topK = 5, onStreamDelta = null } = {}
+  { topK = 5, userId = null, onStreamDelta = null } = {}
 ) {
   const pipelineStartMs = performance.now();
 
-  // 1. Hybrid Retrieval + Cross-Encoder Filtering + Context Compaction
-  const retrievalResult = await retrieveAndCompact(query, topK);
+  // 1. Hybrid Retrieval + Cross-Encoder Filtering + Context Compaction (User-Scoped)
+  const retrievalResult = await retrieveAndCompact(query, topK, userId);
   const retrievalLatencyMs = Math.round(performance.now() - pipelineStartMs);
 
   // 2. Deterministic Abstention Short-Circuit:
@@ -95,7 +96,7 @@ export async function generateGroundedAnswer(
     };
   }
 
-  // 3. Stream Grounded JSON Response from Gemini 2.5 Flash
+  // 3. Stream Grounded JSON Response from Gemini
   const genStartMs = performance.now();
   let ttftMs = null;
   let accumulatedJsonText = '';

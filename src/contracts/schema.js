@@ -114,7 +114,19 @@ export function validateLLMOutput(payload) {
  * 3. MongoDB Vector Document Factory & Validator
  * Ensures every chunk ingested via yt-dlp conforms to the Atlas Hybrid Search contract.
  */
+// export function createVectorChunkDocument({
+//   videoId,
+//   title,
+//   url,
+//   startSeconds,
+//   endSeconds,
+//   displayTimestamp,
+//   content,
+//   embedding,
+//   tokenCount,
+// }) {
 export function createVectorChunkDocument({
+  userId = 'system',
   videoId,
   title,
   url,
@@ -136,20 +148,20 @@ export function createVectorChunkDocument({
   }
 
   return {
-    chunk_id: chunkId,
+    user_id: String(userId || 'system'),
+    chunk_id: `vid_${videoId}_${displayTimestamp}`,
     video_metadata: {
       video_id: videoId,
-      title: title.trim(),
-      url: url.trim(),
+      title,
+      url,
     },
     time_bounds: {
-      start_seconds: Number(startSeconds),
-      end_seconds: Number(endSeconds),
+      start_seconds: startSeconds,
+      end_seconds: endSeconds,
       display_timestamp: displayTimestamp,
     },
-    content: content.trim(),
+    content,
     embedding,
-    token_count: Number(tokenCount),
-    created_at: new Date(),
+    token_count: tokenCount,
   };
 }

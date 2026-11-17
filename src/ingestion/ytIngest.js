@@ -794,14 +794,15 @@ function getMockLectureData() {
 /**
  * Main Ingestion Runner (with 10x Faster Parallel Batch Embedding & Clean Video Upsert)
  */
-export async function ingestVideo({ videoUrl, useMock = false }) {
+export async function ingestVideo({ videoUrl, useMock = false, userId = 'system' }) {
+  const ownerId = String(userId || 'system');
   await ensureStandardIndexes();
   const collection = await getChunksCollection();
 
   console.log(
     useMock
       ? '[Ingest] Loading seed lecture (vid_72x) for golden dataset verification...'
-      : `[Ingest] Extracting transcript for ${videoUrl}...`
+      : `[Ingest] Extracting transcript for ${videoUrl} (owner: ${ownerId})...`
   );
 
   const { videoId, title, url, segments } = useMock
@@ -824,6 +825,7 @@ export async function ingestVideo({ videoUrl, useMock = false }) {
       batch.map(async (chunk) => {
         const embedding = await embedChunkWithRetry(chunk.content, title);
         return createVectorChunkDocument({
+          userId: ownerId,
           videoId,
           title,
           url,
@@ -840,7 +842,7 @@ export async function ingestVideo({ videoUrl, useMock = false }) {
     for (const validatedDoc of batchDocs) {
       operations.push({
         updateOne: {
-          filter: { chunk_id: validatedDoc.chunk_id },
+          filter: { user_id: ownerId, chunk_id: validatedDoc.chunk_id },
           update: { $set: validatedDoc },
           upsert: true,
         },
@@ -852,8 +854,11 @@ export async function ingestVideo({ videoUrl, useMock = false }) {
   }
 
   if (operations.length > 0) {
-    // Remove any stale/partial chunks for this videoId before writing the fresh set
-    await collection.deleteMany({ 'video_metadata.video_id': videoId });
+    // Remove any stale/partial chunks for this user & videoId before writing the fresh set
+    await collection.deleteMany({
+      user_id: ownerId,
+      'video_metadata.video_id': videoId,
+    });
 
     const result = await collection.bulkWrite(operations);
     console.log(

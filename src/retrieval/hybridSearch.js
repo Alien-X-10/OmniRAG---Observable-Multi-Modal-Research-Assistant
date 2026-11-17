@@ -7,8 +7,8 @@ const BM25_INDEX_NAME = 'bm25_index';
 const RRF_K = 60; // Standard Reciprocal Rank Fusion constant
 
 /**
- * Automatically creates the Atlas Vector Search and BM25 Search indexes
- * if they do not exist yet, dynamically matching your stored embedding dimension (3072).
+ * Automatically creates or upgrades the Atlas Vector Search and BM25 Search indexes
+ * so `user_id` filtering is supported natively at scale.
  */
 export async function ensureSearchIndexes() {
   const collection = await getChunksCollection();
@@ -22,47 +22,70 @@ export async function ensureSearchIndexes() {
 
   const numDimensions = sampleDoc.embedding.length;
 
+  const vectorDefinition = {
+    fields: [
+      {
+        type: 'vector',
+        path: 'embedding',
+        numDimensions,
+        similarity: 'cosine',
+      },
+      {
+        type: 'filter',
+        path: 'user_id',
+      },
+      {
+        type: 'filter',
+        path: 'video_metadata.video_id',
+      },
+    ],
+  };
+
+  const bm25Definition = {
+    mappings: {
+      dynamic: false,
+      fields: {
+        content: { type: 'string', analyzer: 'lucene.standard' },
+        chunk_id: { type: 'token' },
+        user_id: { type: 'token' },
+      },
+    },
+  };
+
   try {
     const existing = await collection.listSearchIndexes().toArray();
-    const existingNames = new Set(existing.map((idx) => idx.name));
+    const existingMap = new Map(existing.map((idx) => [idx.name, idx]));
 
     const indexesToCreate = [];
 
-    if (!existingNames.has(VECTOR_INDEX_NAME)) {
+    if (!existingMap.has(VECTOR_INDEX_NAME)) {
       indexesToCreate.push({
         name: VECTOR_INDEX_NAME,
         type: 'vectorSearch',
-        definition: {
-          fields: [
-            {
-              type: 'vector',
-              path: 'embedding',
-              numDimensions,
-              similarity: 'cosine',
-            },
-            {
-              type: 'filter',
-              path: 'video_metadata.video_id',
-            },
-          ],
-        },
+        definition: vectorDefinition,
       });
+    } else {
+      const existingFields = existingMap.get(VECTOR_INDEX_NAME)?.latestDefinition?.fields || [];
+      const hasUserFilter = existingFields.some((f) => f.path === 'user_id');
+      if (!hasUserFilter && typeof collection.updateSearchIndex === 'function') {
+        await collection.updateSearchIndex(VECTOR_INDEX_NAME, vectorDefinition);
+        console.log(`[Atlas Search] Updated "${VECTOR_INDEX_NAME}" with user_id filter.`);
+      }
     }
 
-    if (!existingNames.has(BM25_INDEX_NAME)) {
+    if (!existingMap.has(BM25_INDEX_NAME)) {
       indexesToCreate.push({
         name: BM25_INDEX_NAME,
         type: 'search',
-        definition: {
-          mappings: {
-            dynamic: false,
-            fields: {
-              content: { type: 'string', analyzer: 'lucene.standard' },
-              chunk_id: { type: 'token' },
-            },
-          },
-        },
+        definition: bm25Definition,
       });
+    } else {
+      const existingMappings =
+        existingMap.get(BM25_INDEX_NAME)?.latestDefinition?.mappings?.fields || {};
+      if (!existingMappings.user_id && typeof collection.updateSearchIndex === 'function') {
+        await collection.updateSearchIndex(BM25_INDEX_NAME, bm25Definition);
+        console.log(`[Atlas Search] Updated "${BM25_INDEX_NAME}" with user_id token field.`);
+      }
     }
 
     if (indexesToCreate.length > 0) {
@@ -81,7 +104,7 @@ export async function ensureSearchIndexes() {
 }
 
 /**
- * Cosine similarity helper (used as an instant fallback while Atlas finishes building vector_index).
+ * Cosine similarity helper (used as an instant exact-KNN fallback while Atlas builds/updates vector_index).
  */
 function cosineSimilarity(vecA, vecB) {
   let dot = 0;
@@ -97,21 +120,25 @@ function cosineSimilarity(vecA, vecB) {
 }
 
 /**
- * 1. Dense Vector Search ($vectorSearch with instant exact-knn fallback if index is still building)
+ * 1. Dense Vector Search ($vectorSearch scoped by user_id with exact-KNN fallback)
  */
-async function runDenseVectorSearch(collection, queryVector, topK = 10) {
+async function runDenseVectorSearch(collection, queryVector, topK = 10, userId = null) {
+  const ownerId = userId ? String(userId) : null;
+  const mongoFilter = ownerId ? { user_id: ownerId } : {};
+
   try {
+    const vectorSearchStage = {
+      index: VECTOR_INDEX_NAME,
+      path: 'embedding',
+      queryVector,
+      numCandidates: topK * 10,
+      limit: topK,
+      ...(ownerId ? { filter: { user_id: ownerId } } : {}),
+    };
+
     const results = await collection
       .aggregate([
-        {
-          $vectorSearch: {
-            index: VECTOR_INDEX_NAME,
-            path: 'embedding',
-            queryVector,
-            numCandidates: topK * 10,
-            limit: topK,
-          },
-        },
+        { $vectorSearch: vectorSearchStage },
         {
           $project: {
             _id: 0,
@@ -128,11 +155,11 @@ async function runDenseVectorSearch(collection, queryVector, topK = 10) {
 
     if (results.length > 0) return results;
   } catch {
-    // Fallback if Atlas vector_index is still in INITIAL_SYNC state
+    // Fallback if Atlas vector_index is still building or updating user_id filter
   }
 
-  const allDocs = await collection.find({}).toArray();
-  return allDocs
+  const userDocs = await collection.find(mongoFilter).toArray();
+  return userDocs
     .map((doc) => ({
       chunk_id: doc.chunk_id,
       content: doc.content,
@@ -146,21 +173,46 @@ async function runDenseVectorSearch(collection, queryVector, topK = 10) {
 }
 
 /**
- * 2. BM25 Lexical Search ($search with instant lexical fallback if index is still building)
+ * 2. BM25 Lexical Search ($search scoped by user_id with instant lexical fallback)
  */
-async function runBM25KeywordSearch(collection, queryText, topK = 10) {
+async function runBM25KeywordSearch(collection, queryText, topK = 10, userId = null) {
+  const ownerId = userId ? String(userId) : null;
+  const mongoFilter = ownerId ? { user_id: ownerId } : {};
+
   try {
+    const searchStage = ownerId
+      ? {
+          index: BM25_INDEX_NAME,
+          compound: {
+            must: [
+              {
+                text: {
+                  query: queryText,
+                  path: 'content',
+                },
+              },
+            ],
+            filter: [
+              {
+                equals: {
+                  path: 'user_id',
+                  value: ownerId,
+                },
+              },
+            ],
+          },
+        }
+      : {
+          index: BM25_INDEX_NAME,
+          text: {
+            query: queryText,
+            path: 'content',
+          },
+        };
+
     const results = await collection
       .aggregate([
-        {
-          $search: {
-            index: BM25_INDEX_NAME,
-            text: {
-              query: queryText,
-              path: 'content',
-            },
-          },
-        },
+        { $search: searchStage },
         { $limit: topK },
         {
           $project: {
@@ -178,7 +230,7 @@ async function runBM25KeywordSearch(collection, queryText, topK = 10) {
 
     if (results.length > 0) return results;
   } catch {
-    // Fallback if Atlas bm25_index is still in INITIAL_SYNC state
+    // Fallback if Atlas bm25_index is still building or updating user_id mapping
   }
 
   const terms = queryText
@@ -187,8 +239,8 @@ async function runBM25KeywordSearch(collection, queryText, topK = 10) {
     .split(/\s+/)
     .filter((t) => t.length > 2);
 
-  const allDocs = await collection.find({}).toArray();
-  return allDocs
+  const userDocs = await collection.find(mongoFilter).toArray();
+  return userDocs
     .map((doc) => {
       const lowerContent = doc.content.toLowerCase();
       let score = 0;
@@ -250,16 +302,16 @@ export function computeReciprocalRankFusion(vectorResults, bm25Results, k = RRF_
 }
 
 /**
- * Main Hybrid Retrieval Pipeline
+ * Main Hybrid Retrieval Pipeline (User-Scoped)
  */
-export async function hybridRetrieve(queryText, topK = 5) {
+export async function hybridRetrieve(queryText, topK = 5, userId = null) {
   const collection = await getChunksCollection();
   const queryVector = await embedSearchQuery(queryText);
 
-  // Execute Dense Vector Search and BM25 Search in parallel
+  // Execute Dense Vector Search and BM25 Search in parallel (scoped to userId when provided)
   const [vectorResults, bm25Results] = await Promise.all([
-    runDenseVectorSearch(collection, queryVector, topK * 2),
-    runBM25KeywordSearch(collection, queryText, topK * 2),
+    runDenseVectorSearch(collection, queryVector, topK * 2, userId),
+    runBM25KeywordSearch(collection, queryText, topK * 2, userId),
   ]);
 
   const fusedResults = computeReciprocalRankFusion(vectorResults, bm25Results);

@@ -137,10 +137,10 @@ ${JSON.stringify(promptPayload, null, 2)}`,
 }
 
 /**
- * 3. Full Retrieval + Re-Ranking + Context Compaction Pipeline
+ * 3. Full Retrieval + Re-Ranking + Context Compaction Pipeline (User-Scoped)
  */
-export async function retrieveAndCompact(query, topK = 5) {
-  const rrfCandidates = await hybridRetrieve(query, topK);
+export async function retrieveAndCompact(query, topK = 5, userId = null) {
+  const rrfCandidates = await hybridRetrieve(query, topK, userId);
   const relevantChunks = await crossEncodeRerank(query, rrfCandidates);
 
   let totalOriginalTokens = 0;

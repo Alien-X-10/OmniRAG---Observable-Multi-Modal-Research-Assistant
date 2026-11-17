@@ -4,19 +4,28 @@ import React from 'react';
 /**
  * Top-left project title & active username bar above the main glowing frame
  */
-export function ProjectBrandHeader({ username }) {
+export function ProjectBrandHeader({ username, onLogoutClick }) {
   return (
-    <div className="w-full max-w-[1220px] mb-2.5 px-1 select-none">
-      <h1 className="text-lg sm:text-xl font-medium text-gray-200 tracking-tight">
-        OmniRAG - Observable Multi-Modal Research Assistant
-      </h1>
-      <p className="text-xs sm:text-sm text-gray-500 font-mono mt-0.5">
-        user: <span className="text-gray-400">{username || 'guest'}</span>
-      </p>
+    <div className="w-full max-w-[1600px] mb-2.5 px-1 flex items-center justify-between select-none">
+      <div>
+        <h1 className="text-lg sm:text-2xl font-medium text-gray-200 tracking-tight">
+          OmniRAG - Observable Multi-Modal Research Assistant
+        </h1>
+        <p className="text-xs sm:text-sm text-gray-500 font-mono mt-0.5">
+          user: <span className="text-gray-400">{username || 'guest'}</span>
+        </p>
+      </div>
+
+      <button
+        type="button"
+        onClick={onLogoutClick}
+        className="px-4 py-1.5 rounded-lg bg-red-950/40 border border-red-500/80 text-xs font-medium text-red-400 shadow-[0_0_20px_rgba(239,68,68,0.45),inset_0_0_10px_rgba(239,68,68,0.2)] hover:bg-red-900/50 hover:border-red-400 hover:text-red-300 transition-all"
+      >
+        {username ? 'Logout' : 'Sign In'}
+      </button>
     </div>
   );
 }
-
 /**
  * Inner top navigation bar for the right-hand AI workspace
  */
@@ -29,7 +38,7 @@ export default function WorkspaceNavbar({
   onLogoutClick,
 }) {
   return (
-    <header className="h-14 px-6 flex items-center justify-between border-b border-midnight-700/80 shrink-0 select-none">
+    <header className="h-14 px-4 flex items-center justify-between border-b border-midnight-700/80 shrink-0 select-none">
       {/* Left/Center Navigation Pill */}
       <nav className="flex items-center gap-1 bg-midnight-800/90 border border-midnight-700/90 rounded-full px-2 py-1">
         {/* + Ingest Button */}
@@ -133,13 +142,13 @@ export default function WorkspaceNavbar({
       </nav>
 
       {/* Far Right: Logout / Sign In Button */}
-      <button
+      {/* <button
         type="button"
         onClick={onLogoutClick}
         className="px-4 py-1.5 rounded-lg bg-midnight-800/90 border border-midnight-700 hover:border-neon-500/50 text-xs font-medium text-gray-300 hover:text-neon-400 transition-all"
       >
         {username ? 'Logout' : 'Sign In'}
-      </button>
+      </button> */}
     </header>
   );
 }

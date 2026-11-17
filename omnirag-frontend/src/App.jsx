@@ -395,7 +395,12 @@ if (!username) {
   return (
     <div className="min-h-screen w-screen bg-midnight-950 flex flex-col items-center justify-center p-3 sm:p-6">
       {/* Top-Left Project Branding & Active Username */}
-      <ProjectBrandHeader username={username} />
+      {/* <ProjectBrandHeader username={username} /> */}
+
+      <ProjectBrandHeader
+        username={username}
+        onLogoutClick={handleLogoutOrSignInClick}
+      />
 
       {/* Main Outer Frame with Diffused Neon Green Ambient Glow */}
       <div className="w-full max-w-[1220px] h-[84vh] max-h-[750px] rounded-2xl bg-midnight-900 border border-neon-500/40 shadow-emerald-window flex overflow-hidden">
@@ -404,14 +409,20 @@ if (!username) {
 
         {/* Right Column: Top Navbar + Active View + Bottom Command Bar */}
         <main className="flex-1 flex flex-col min-w-0 bg-midnight-900">
-          <WorkspaceNavbar
+          {/* <WorkspaceNavbar
             activeTab={activeTab}
             setActiveTab={setActiveTab}
             onOpenIngest={() => setIsIngestOpen(true)}
             chatCount={messages.length}
             username={username}
             onLogoutClick={handleLogoutOrSignInClick}
-          />
+          /> */}
+          <WorkspaceNavbar
+        activeTab={activeTab}
+        setActiveTab={setActiveTab}
+        onOpenIngest={() => setIsIngestOpen(true)}
+        chatCount={messages.length}
+      />
 
           {activeTab === 'chat' && (
             <ChatWindow messages={messages} isStreaming={isStreaming} />
