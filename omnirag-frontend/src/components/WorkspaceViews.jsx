@@ -1,5 +1,7 @@
 // File: omnirag-frontend/src/components/WorkspaceViews.jsx
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+
+const ITEMS_PER_PAGE = 10;
 
 /**
  * Converts "mm:ss" or "hh:mm:ss" into total seconds for YouTube ?t= links
@@ -13,14 +15,147 @@ function timestampToSeconds(ts = '') {
 }
 
 /**
- * History Tab View: 2-View Toggle between Query Audit History & Ingested Corpus
+ * Builds compact page number array (with ellipsis when totalPages > 7)
+ */
+function getPageNumbers(currentPage, totalPages) {
+  if (totalPages <= 7) {
+    return Array.from({ length: totalPages }, (_, i) => i + 1);
+  }
+  const pages = new Set([
+    1,
+    totalPages,
+    currentPage,
+    currentPage - 1,
+    currentPage + 1,
+  ]);
+  const sorted = Array.from(pages)
+    .filter((p) => p >= 1 && p <= totalPages)
+    .sort((a, b) => a - b);
+
+  const result = [];
+  for (let i = 0; i < sorted.length; i++) {
+    if (i > 0 && sorted[i] - sorted[i - 1] > 1) {
+      result.push('...');
+    }
+    result.push(sorted[i]);
+  }
+  return result;
+}
+
+/**
+ * Reusable Pagination Controls (10 items per page)
+ */
+function PaginationControls({
+  currentPage,
+  totalPages,
+  totalItems,
+  startIndex,
+  endIndex,
+  onPageChange,
+  position = 'bottom', // 'top' | 'bottom'
+  rightSummary = null,
+}) {
+  const isTop = position === 'top';
+
+  if (totalItems === 0) {
+    if (isTop && rightSummary) {
+      return (
+        <div className="flex items-center justify-end pt-0.5">
+          <span className="text-xs text-gray-400 font-mono">{rightSummary}</span>
+        </div>
+      );
+    }
+    return null;
+  }
+
+  const pageNumbers = getPageNumbers(currentPage, totalPages);
+
+  const pageButtons = (
+    <div className="flex flex-wrap items-center gap-1.5">
+      <button
+        type="button"
+        disabled={currentPage <= 1}
+        onClick={() => onPageChange(currentPage - 1)}
+        className="px-2.5 py-1 rounded-lg text-xs font-mono bg-midnight-900 border border-midnight-700 text-gray-300 hover:border-neon-500/60 hover:text-neon-400 transition-colors disabled:opacity-40 disabled:pointer-events-none"
+      >
+        ← Prev
+      </button>
+
+      {pageNumbers.map((item, idx) =>
+        item === '...' ? (
+          <span
+            key={`ellipsis-${idx}`}
+            className="px-2 py-1 text-xs font-mono text-gray-500 select-none"
+          >
+            ...
+          </span>
+        ) : (
+          <button
+            key={`page-${item}`}
+            type="button"
+            onClick={() => onPageChange(item)}
+            className={`min-w-[30px] px-2.5 py-1 rounded-lg text-xs font-mono border transition-all ${
+              currentPage === item
+                ? 'bg-neon-500/20 border-neon-500 text-neon-300 shadow-emerald-glow font-semibold'
+                : 'bg-midnight-900 border-midnight-700 text-gray-400 hover:border-neon-500/50 hover:text-gray-200'
+            }`}
+          >
+            {item}
+          </button>
+        )
+      )}
+
+      <button
+        type="button"
+        disabled={currentPage >= totalPages}
+        onClick={() => onPageChange(currentPage + 1)}
+        className="px-2.5 py-1 rounded-lg text-xs font-mono bg-midnight-900 border border-midnight-700 text-gray-300 hover:border-neon-500/60 hover:text-neon-400 transition-colors disabled:opacity-40 disabled:pointer-events-none"
+      >
+        Next →
+      </button>
+    </div>
+  );
+
+  const rangeLabel = (
+    <span className="text-xs font-mono text-gray-400">
+      Showing {startIndex + 1}–{endIndex} of {totalItems}
+    </span>
+  );
+
+  if (isTop) {
+    return (
+      <div className="pt-0.5 flex flex-wrap items-center justify-between gap-3">
+        <div className="flex flex-wrap items-center gap-3">
+          {pageButtons}
+          {rangeLabel}
+        </div>
+        {rightSummary && (
+          <span className="text-xs text-gray-400 font-mono">{rightSummary}</span>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div className="pt-3 pb-1 flex flex-col sm:flex-row items-center justify-between gap-3 border-t border-midnight-800/90">
+      {rangeLabel}
+      {pageButtons}
+    </div>
+  );
+}
+
+/**
+ * History Tab View: Static Top Header + Independent Scrollable List + 10-Item Pagination
  */
 export function HistoryView({ telemetry, messages = [], onLoadTrace, onRerunQuery }) {
   const [activeSubTab, setActiveSubTab] = useState('queries'); // 'queries' | 'corpus'
   const [videos, setVideos] = useState([]);
   const [loadingVideos, setLoadingVideos] = useState(false);
   const [deletingId, setDeletingId] = useState(null);
+  const [queryPage, setQueryPage] = useState(1);
+  const [corpusPage, setCorpusPage] = useState(1);
 
+  const scrollContainerRef = useRef(null);
   const recentTraces = telemetry?.recent_traces || [];
 
   const fetchCorpus = useCallback(async () => {
@@ -69,268 +204,345 @@ export function HistoryView({ telemetry, messages = [], onLoadTrace, onRerunQuer
     }
   };
 
-  return (
-    <div className="flex-1 overflow-y-auto px-6 py-5 space-y-4">
-      {/* Side-by-Side Capsule Sub-Tab Toggle Buttons */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pb-1">
-        <button
-          type="button"
-          onClick={() => setActiveSubTab('queries')}
-          className={`relative py-2.5 px-4 rounded-full text-xs sm:text-sm font-medium transition-all border ${
-            activeSubTab === 'queries'
-              ? 'bg-neon-500/15 border-neon-500 text-neon-400 shadow-emerald-glow'
-              : 'bg-midnight-800/70 border-midnight-700 text-gray-400 hover:text-gray-200 hover:border-midnight-600'
-          }`}
-        >
-          Recent Query & Telemetry History
-        </button>
+  const handleSwitchSubTab = (tab) => {
+    setActiveSubTab(tab);
+    if (tab === 'queries') setQueryPage(1);
+    if (tab === 'corpus') setCorpusPage(1);
+    if (scrollContainerRef.current) {
+      scrollContainerRef.current.scrollTo({ top: 0 });
+    }
+  };
 
-        <button
-          type="button"
-          onClick={() => setActiveSubTab('corpus')}
-          className={`relative py-2.5 px-4 rounded-full text-xs sm:text-sm font-medium transition-all border ${
-            activeSubTab === 'corpus'
-              ? 'bg-neon-500/15 border-neon-500 text-neon-400 shadow-emerald-glow'
-              : 'bg-midnight-800/70 border-midnight-700 text-gray-400 hover:text-gray-200 hover:border-midnight-600'
-          }`}
-        >
-          Ingested Video Corpus // Active Knowledge Base
-        </button>
+  const handlePageChange = (setter, nextPage) => {
+    setter(nextPage);
+    if (scrollContainerRef.current) {
+      scrollContainerRef.current.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+  };
+
+  // Pagination calculations for Query History (10 per page)
+  const totalQueryPages = Math.max(1, Math.ceil(recentTraces.length / ITEMS_PER_PAGE));
+  const safeQueryPage = Math.min(queryPage, totalQueryPages);
+  const queryStartIndex = (safeQueryPage - 1) * ITEMS_PER_PAGE;
+  const paginatedTraces = recentTraces.slice(
+    queryStartIndex,
+    queryStartIndex + ITEMS_PER_PAGE
+  );
+
+  // Pagination calculations for Ingested Corpus (10 per page)
+  const totalCorpusPages = Math.max(1, Math.ceil(videos.length / ITEMS_PER_PAGE));
+  const safeCorpusPage = Math.min(corpusPage, totalCorpusPages);
+  const corpusStartIndex = (safeCorpusPage - 1) * ITEMS_PER_PAGE;
+  const paginatedVideos = videos.slice(
+    corpusStartIndex,
+    corpusStartIndex + ITEMS_PER_PAGE
+  );
+
+  return (
+    <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
+      {/* STATIC TOP BAR: Capsule Sub-Tab Switcher + Pinned Pagination & Summary */}
+      <div className="shrink-0 px-6 pt-5 pb-3 border-b border-midnight-800/80 bg-midnight-900/95 space-y-3">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <button
+            type="button"
+            onClick={() => handleSwitchSubTab('queries')}
+            className={`relative py-2.5 px-4 rounded-full text-xs sm:text-sm font-medium transition-all border ${
+              activeSubTab === 'queries'
+                ? 'bg-neon-500/15 border-neon-500 text-neon-400 shadow-emerald-glow'
+                : 'bg-midnight-800/70 border-midnight-700 text-gray-400 hover:text-gray-200 hover:border-midnight-600'
+            }`}
+          >
+            Recent Query & Telemetry History
+          </button>
+
+          <button
+            type="button"
+            onClick={() => handleSwitchSubTab('corpus')}
+            className={`relative py-2.5 px-4 rounded-full text-xs sm:text-sm font-medium transition-all border ${
+              activeSubTab === 'corpus'
+                ? 'bg-neon-500/15 border-neon-500 text-neon-400 shadow-emerald-glow'
+                : 'bg-midnight-800/70 border-midnight-700 text-gray-400 hover:text-gray-200 hover:border-midnight-600'
+            }`}
+          >
+            Ingested Video Corpus // Active Knowledge Base
+          </button>
+        </div>
+
+        {/* Pinned Top Pagination & Summary Row */}
+        {activeSubTab === 'queries' ? (
+          <PaginationControls
+            position="top"
+            currentPage={safeQueryPage}
+            totalPages={totalQueryPages}
+            totalItems={recentTraces.length}
+            startIndex={queryStartIndex}
+            endIndex={queryStartIndex + paginatedTraces.length}
+            onPageChange={(page) => handlePageChange(setQueryPage, page)}
+            rightSummary={`Page ${safeQueryPage} of ${totalQueryPages} · Total Logged Requests: ${
+              telemetry?.total_requests ?? messages.length
+            }`}
+          />
+        ) : (
+          <PaginationControls
+            position="top"
+            currentPage={safeCorpusPage}
+            totalPages={totalCorpusPages}
+            totalItems={videos.length}
+            startIndex={corpusStartIndex}
+            endIndex={corpusStartIndex + paginatedVideos.length}
+            onPageChange={(page) => handlePageChange(setCorpusPage, page)}
+            rightSummary={`Page ${safeCorpusPage} of ${totalCorpusPages} · ${videos.length} Resource(s) Indexed`}
+          />
+        )}
       </div>
 
-      {/* VIEW 1: Recent Query & Telemetry History */}
-      {activeSubTab === 'queries' && (
-        <div className="space-y-3">
-          <div className="flex items-center justify-between">
-            <h2 className="text-xs font-semibold uppercase tracking-wider text-gray-300">
-              Recent Query & Telemetry History
-            </h2>
-            <span className="text-xs text-gray-400 font-mono">
-              Total Logged Requests: {telemetry?.total_requests ?? messages.length}
-            </span>
-          </div>
+      {/* INDEPENDENT SCROLLABLE CONTENT + BOTTOM PAGINATION */}
+      <div
+        ref={scrollContainerRef}
+        className="flex-1 overflow-y-auto px-6 py-4 space-y-3"
+      >
+        {/* VIEW 1: Recent Query & Telemetry History (10 per page) */}
+        {activeSubTab === 'queries' && (
+          <>
+            {recentTraces.length === 0 ? (
+              <div className="rounded-xl bg-midnight-800/60 border border-midnight-700 p-6 text-center text-xs text-gray-400">
+                No persisted telemetry traces found yet. Ask a question in the Chat tab
+                to populate history.
+              </div>
+            ) : (
+              <>
+                <div className="space-y-3">
+                  {paginatedTraces.map((trace) => {
+                    const sessionMatch = messages.find(
+                      (m) => m.question === trace.query && m.citations?.length > 0
+                    );
+                    const citations =
+                      trace.citations?.length > 0
+                        ? trace.citations
+                        : sessionMatch?.citations || [];
+                    const citationCount =
+                      citations.length || trace.citations_count || 0;
 
-          {recentTraces.length === 0 ? (
-            <div className="rounded-xl bg-midnight-800/60 border border-midnight-700 p-6 text-center text-xs text-gray-400">
-              No persisted telemetry traces found yet. Ask a question in the Chat tab
-              to populate history.
-            </div>
-          ) : (
-            <div className="space-y-3">
-              {recentTraces.map((trace) => {
-                const sessionMatch = messages.find(
-                  (m) => m.question === trace.query && m.citations?.length > 0
-                );
-                const citations =
-                  trace.citations?.length > 0
-                    ? trace.citations
-                    : sessionMatch?.citations || [];
-                const citationCount =
-                  citations.length || trace.citations_count || 0;
-
-                return (
-                  <div
-                    key={trace.request_id}
-                    onClick={() => onLoadTrace && onLoadTrace({ ...trace, citations })}
-                    className="rounded-xl bg-midnight-800/80 border border-midnight-700/90 hover:border-neon-500/50 p-4 transition-all space-y-2.5 cursor-pointer"
-                  >
-                    {/* Top Row: Question + Status Badges + Re-run Button */}
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="text-sm font-medium text-gray-100 truncate">
-                        {trace.query}
-                      </span>
-
-                      <div className="flex items-center gap-2 shrink-0">
-                        {!trace.is_abstained && (
-                          <span className="px-2.5 py-0.5 rounded-full text-[11px] font-medium border bg-neon-500/15 border-neon-500/40 text-neon-400">
-                            GROUNDED
-                          </span>
-                        )}
-
-                        <span
-                          className={`px-2.5 py-0.5 rounded-full text-[11px] font-medium border ${
-                            trace.is_abstained
-                              ? 'bg-abstain-bg border-abstain-border text-abstain-text'
-                              : 'bg-neon-500/10 border-neon-500/30 text-neon-400'
-                          }`}
-                        >
-                          {trace.is_abstained
-                            ? 'Abstained'
-                            : `${citationCount} Citation(s)`}
-                        </span>
-
-                        <button
-                          type="button"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            onRerunQuery && onRerunQuery(trace.query);
-                          }}
-                          className="px-2.5 py-0.5 rounded-lg text-[11px] font-mono bg-midnight-900 border border-midnight-700 hover:border-neon-500/60 text-gray-300 hover:text-neon-400 transition-colors"
-                        >
-                          ↻ Re-run
-                        </button>
-                      </div>
-                    </div>
-
-                    {/* Middle Row: Clickable Timestamp Citation Pills or Abstention Note */}
-                    {trace.is_abstained ? (
-                      <div className="text-xs text-gray-400">
-                        System Abstained: Search parameters unmet.
-                      </div>
-                    ) : (
-                      citations.length > 0 && (
-                        <div className="flex flex-wrap items-center gap-2 pt-0.5">
-                          {citations.map((cit, idx) => {
-                            const isPdfCit = String(cit.video_id || '').startsWith('pdf_');
-                            if (isPdfCit) {
-                              return (
-                                <span
-                                  key={`${cit.chunk_id || idx}`}
-                                  onClick={(e) => e.stopPropagation()}
-                                  className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-mono bg-neon-500/10 border border-neon-500/40 text-neon-300"
-                                >
-                                  <span>📄</span>
-                                  <span>
-                                    {cit.video_id} @ {cit.timestamp}
-                                  </span>
-                                </span>
-                              );
-                            }
-
-                            const sec = timestampToSeconds(cit.timestamp);
-                            const ytUrl = `https://www.youtube.com/watch?v=${cit.video_id}&t=${sec}s`;
-                            return (
-                              <a
-                                key={`${cit.chunk_id || idx}`}
-                                href={ytUrl}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                onClick={(e) => e.stopPropagation()}
-                                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-mono bg-neon-500/10 border border-neon-500/40 text-neon-400 hover:bg-neon-500/20 transition-colors"
-                              >
-                                <span>
-                                  {cit.video_id} @ {cit.timestamp}
-                                </span>
-                                <span>↗️</span>
-                              </a>
-                            );
-                          })}
-                        </div>
-                      )
-                    )}
-
-                    {/* Bottom Row: Per-Query Telemetry Metrics */}
-                    <div className="flex flex-wrap items-center gap-4 text-xs text-gray-400 font-mono pt-0.5">
-                      <span>Model: {trace.model}</span>
-                      <span>TTFT: {trace.latency_ms?.ttft ?? 0} ms</span>
-                      <span>Total: {trace.latency_ms?.total ?? 0} ms</span>
-                      <span>Tokens: {trace.tokens?.total ?? 0}</span>
-                      <span>
-                        Cost: ${Number(trace.estimated_cost_usd || 0).toFixed(6)}
-                      </span>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* VIEW 2: Ingested Multi-Modal Corpus // Active Knowledge Base */}
-      {activeSubTab === 'corpus' && (
-        <div className="space-y-3">
-          <div className="flex items-center justify-between">
-            <h2 className="text-xs font-semibold uppercase tracking-wider text-gray-300">
-              Ingested Video Corpus // Active Knowledge Base
-            </h2>
-            <span className="text-xs text-gray-400 font-mono">
-              {videos.length} Resource(s) Indexed
-            </span>
-          </div>
-
-          {loadingVideos ? (
-            <div className="rounded-xl bg-midnight-800/60 border border-midnight-700 p-6 text-center text-xs text-gray-400 font-mono">
-              Scanning MongoDB video_chunks collection...
-            </div>
-          ) : videos.length === 0 ? (
-            <div className="rounded-xl bg-midnight-800/60 border border-midnight-700 p-6 text-center text-xs text-gray-400">
-              No videos or PDFs indexed in MongoDB yet. Click &quot;+ Ingest&quot; in
-              the top bar to add a YouTube lecture or PDF.
-            </div>
-          ) : (
-            <div className="space-y-3">
-              {videos.map((vid) => {
-                const isPdf = String(vid.video_id || '').startsWith('pdf_');
-                const videoUrl =
-                  vid.url || `https://www.youtube.com/watch?v=${vid.video_id}`;
-
-                return (
-                  <div
-                    key={vid.video_id}
-                    className="rounded-xl bg-midnight-800/80 border border-midnight-700/90 hover:border-neon-500/40 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 transition-all"
-                  >
-                    <div className="space-y-1 min-w-0">
-                      <div className="flex items-center gap-2.5">
-                        {isPdf ? (
-                          <span className="px-2 py-0.5 rounded bg-neon-500/10 border border-neon-500/40 text-[11px] font-mono text-neon-300 shrink-0">
-                            📄 PDF
-                          </span>
-                        ) : (
-                          <span className="px-2 py-0.5 rounded bg-midnight-900 border border-midnight-700 text-[11px] font-mono text-neon-400 shrink-0">
-                            ▶️ YouTube
-                          </span>
-                        )}
-                        <h3 className="text-sm font-medium text-gray-100 truncate">
-                          {vid.title ||
-                            (isPdf
-                              ? `Document ${vid.video_id}`
-                              : `Lecture ${vid.video_id}`)}
-                        </h3>
-                      </div>
-                      <div className="text-xs text-gray-400 font-mono">
-                        ID: {vid.video_id}
-                      </div>
-                    </div>
-
-                    <div className="flex items-center gap-2.5 shrink-0">
-                      <span className="px-2.5 py-1 rounded-full text-[11px] font-mono bg-neon-500/15 border border-neon-500/40 text-neon-400">
-                        {vid.chunk_count} chunks
-                      </span>
-
-                      {!isPdf && (
-                        <a
-                          href={videoUrl}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="px-3 py-1 rounded-lg text-xs font-mono bg-midnight-900 border border-midnight-700 hover:border-neon-500/60 text-gray-200 hover:text-neon-400 transition-colors"
-                        >
-                          ↗️ Watch
-                        </a>
-                      )}
-
-                      <button
-                        type="button"
-                        disabled={deletingId === vid.video_id}
+                    return (
+                      <div
+                        key={trace.request_id}
                         onClick={() =>
-                          handleDeleteVideo(vid.video_id, vid.title)
+                          onLoadTrace && onLoadTrace({ ...trace, citations })
                         }
-                        className="px-3 py-1 rounded-lg text-xs font-mono bg-abstain-bg border border-abstain-border text-abstain-text hover:opacity-90 transition-opacity disabled:opacity-50"
+                        className="rounded-xl bg-midnight-800/80 border border-midnight-700/90 hover:border-neon-500/50 p-4 transition-all space-y-2.5 cursor-pointer"
                       >
-                        {deletingId === vid.video_id
-                          ? 'Removing...'
-                          : isPdf
-                          ? '🗑 Remove PDF'
-                          : '🗑 Remove Video'}
-                      </button>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </div>
-      )}
+                        {/* Top Row: Question + Status Badges + Re-run Button */}
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-sm font-medium text-gray-100 truncate">
+                            {trace.query}
+                          </span>
+
+                          <div className="flex items-center gap-2 shrink-0">
+                            {!trace.is_abstained && (
+                              <span className="px-2.5 py-0.5 rounded-full text-[11px] font-medium border bg-neon-500/15 border-neon-500/40 text-neon-400">
+                                GROUNDED
+                              </span>
+                            )}
+
+                            <span
+                              className={`px-2.5 py-0.5 rounded-full text-[11px] font-medium border ${
+                                trace.is_abstained
+                                  ? 'bg-abstain-bg border-abstain-border text-abstain-text'
+                                  : 'bg-neon-500/10 border-neon-500/30 text-neon-400'
+                              }`}
+                            >
+                              {trace.is_abstained
+                                ? 'Abstained'
+                                : `${citationCount} Citation(s)`}
+                            </span>
+
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                onRerunQuery && onRerunQuery(trace.query);
+                              }}
+                              className="px-2.5 py-0.5 rounded-lg text-[11px] font-mono bg-midnight-900 border border-midnight-700 hover:border-neon-500/60 text-gray-300 hover:text-neon-400 transition-colors"
+                            >
+                              ↻ Re-run
+                            </button>
+                          </div>
+                        </div>
+
+                        {/* Middle Row: Clickable Timestamp Citation Pills or Abstention Note */}
+                        {trace.is_abstained ? (
+                          <div className="text-xs text-gray-400">
+                            System Abstained: Search parameters unmet.
+                          </div>
+                        ) : (
+                          citations.length > 0 && (
+                            <div className="flex flex-wrap items-center gap-2 pt-0.5">
+                              {citations.map((cit, idx) => {
+                                const isPdfCit = String(
+                                  cit.video_id || ''
+                                ).startsWith('pdf_');
+                                if (isPdfCit) {
+                                  return (
+                                    <span
+                                      key={`${cit.chunk_id || idx}`}
+                                      onClick={(e) => e.stopPropagation()}
+                                      className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-mono bg-neon-500/10 border border-neon-500/40 text-neon-300"
+                                    >
+                                      <span>📄</span>
+                                      <span>
+                                        {cit.video_id} @ {cit.timestamp}
+                                      </span>
+                                    </span>
+                                  );
+                                }
+
+                                const sec = timestampToSeconds(cit.timestamp);
+                                const ytUrl = `https://www.youtube.com/watch?v=${cit.video_id}&t=${sec}s`;
+                                return (
+                                  <a
+                                    key={`${cit.chunk_id || idx}`}
+                                    href={ytUrl}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    onClick={(e) => e.stopPropagation()}
+                                    className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-mono bg-neon-500/10 border border-neon-500/40 text-neon-400 hover:bg-neon-500/20 transition-colors"
+                                  >
+                                    <span>
+                                      {cit.video_id} @ {cit.timestamp}
+                                    </span>
+                                    <span>↗️</span>
+                                  </a>
+                                );
+                              })}
+                            </div>
+                          )
+                        )}
+
+                        {/* Bottom Row: Per-Query Telemetry Metrics */}
+                        <div className="flex flex-wrap items-center gap-4 text-xs text-gray-400 font-mono pt-0.5">
+                          <span>Model: {trace.model}</span>
+                          <span>TTFT: {trace.latency_ms?.ttft ?? 0} ms</span>
+                          <span>Total: {trace.latency_ms?.total ?? 0} ms</span>
+                          <span>Tokens: {trace.tokens?.total ?? 0}</span>
+                          <span>
+                            Cost: ${Number(trace.estimated_cost_usd || 0).toFixed(6)}
+                          </span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                <PaginationControls
+                  currentPage={safeQueryPage}
+                  totalPages={totalQueryPages}
+                  totalItems={recentTraces.length}
+                  startIndex={queryStartIndex}
+                  endIndex={queryStartIndex + paginatedTraces.length}
+                  onPageChange={(page) => handlePageChange(setQueryPage, page)}
+                />
+              </>
+            )}
+          </>
+        )}
+
+        {/* VIEW 2: Ingested Multi-Modal Corpus // Active Knowledge Base (10 per page) */}
+        {activeSubTab === 'corpus' && (
+          <>
+            {loadingVideos ? (
+              <div className="rounded-xl bg-midnight-800/60 border border-midnight-700 p-6 text-center text-xs text-gray-400 font-mono">
+                Scanning MongoDB video_chunks collection...
+              </div>
+            ) : videos.length === 0 ? (
+              <div className="rounded-xl bg-midnight-800/60 border border-midnight-700 p-6 text-center text-xs text-gray-400">
+                No videos or PDFs indexed in MongoDB yet. Click &quot;+ Ingest&quot; in
+                the top bar to add a YouTube lecture or PDF.
+              </div>
+            ) : (
+              <>
+                <div className="space-y-3">
+                  {paginatedVideos.map((vid) => {
+                    const isPdf = String(vid.video_id || '').startsWith('pdf_');
+                    const videoUrl =
+                      vid.url || `https://www.youtube.com/watch?v=${vid.video_id}`;
+
+                    return (
+                      <div
+                        key={vid.video_id}
+                        className="rounded-xl bg-midnight-800/80 border border-midnight-700/90 hover:border-neon-500/40 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 transition-all"
+                      >
+                        <div className="space-y-1 min-w-0">
+                          <div className="flex items-center gap-2.5">
+                            {isPdf ? (
+                              <span className="px-2 py-0.5 rounded bg-neon-500/10 border border-neon-500/40 text-[11px] font-mono text-neon-300 shrink-0">
+                                📄 PDF
+                              </span>
+                            ) : (
+                              <span className="px-2 py-0.5 rounded bg-midnight-900 border border-midnight-700 text-[11px] font-mono text-neon-400 shrink-0">
+                                ▶️ YouTube
+                              </span>
+                            )}
+                            <h3 className="text-sm font-medium text-gray-100 truncate">
+                              {vid.title ||
+                                (isPdf
+                                  ? `Document ${vid.video_id}`
+                                  : `Lecture ${vid.video_id}`)}
+                            </h3>
+                          </div>
+                          <div className="text-xs text-gray-400 font-mono">
+                            ID: {vid.video_id}
+                          </div>
+                        </div>
+
+                        <div className="flex items-center gap-2.5 shrink-0">
+                          <span className="px-2.5 py-1 rounded-full text-[11px] font-mono bg-neon-500/15 border border-neon-500/40 text-neon-400">
+                            {vid.chunk_count} chunks
+                          </span>
+
+                          {!isPdf && (
+                            <a
+                              href={videoUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="px-3 py-1 rounded-lg text-xs font-mono bg-midnight-900 border border-midnight-700 hover:border-neon-500/60 text-gray-200 hover:text-neon-400 transition-colors"
+                            >
+                              ↗️ Watch
+                            </a>
+                          )}
+
+                          <button
+                            type="button"
+                            disabled={deletingId === vid.video_id}
+                            onClick={() =>
+                              handleDeleteVideo(vid.video_id, vid.title)
+                            }
+                            className="px-3 py-1 rounded-lg text-xs font-mono bg-abstain-bg border border-abstain-border text-abstain-text hover:opacity-90 transition-opacity disabled:opacity-50"
+                          >
+                            {deletingId === vid.video_id
+                              ? 'Removing...'
+                              : isPdf
+                              ? '🗑 Remove PDF'
+                              : '🗑 Remove Video'}
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                <PaginationControls
+                  currentPage={safeCorpusPage}
+                  totalPages={totalCorpusPages}
+                  totalItems={videos.length}
+                  startIndex={corpusStartIndex}
+                  endIndex={corpusStartIndex + paginatedVideos.length}
+                  onPageChange={(page) => handlePageChange(setCorpusPage, page)}
+                />
+              </>
+            )}
+          </>
+        )}
+      </div>
     </div>
   );
 }
