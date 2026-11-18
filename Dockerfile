@@ -1,7 +1,14 @@
-# File: Dockerfile
+# Stage 1: Build React + Vite Frontend
+FROM node:22-slim AS frontend-builder
+WORKDIR /app/omnirag-frontend
+COPY omnirag-frontend/package*.json ./
+RUN npm ci
+COPY omnirag-frontend/ ./
+RUN npm run build
+
+# Stage 2: Production Backend + Media Tools + Built Frontend
 FROM node:22-slim
 
-# Install Python3, ffmpeg, and yt-dlp for offline YouTube transcript ingestion
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     ffmpeg \
@@ -17,6 +24,7 @@ COPY package*.json ./
 RUN npm ci --omit=dev
 
 COPY . .
+COPY --from=frontend-builder /app/omnirag-frontend/dist ./omnirag-frontend/dist
 
 EXPOSE 3000
 

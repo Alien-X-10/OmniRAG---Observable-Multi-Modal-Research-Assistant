@@ -13,6 +13,8 @@ import { connectDB, closeDB, getChunksCollection } from './config/db.js';
 import { ingestVideo } from './ingestion/ytIngest.js';
 import { ingestPdf } from './ingestion/pdfIngest.js';
 import { registerUser, loginUser, requireAuth } from './services/auth.js';
+import path from 'node:path';
+
 
 dotenv.config({ quiet: true });
 
@@ -26,9 +28,8 @@ const upload = multer({
   limits: { fileSize: 25 * 1024 * 1024 },
 });
 
-app.use(express.static('public'));
-app.get('/', (req, res) => res.sendFile('index.html', { root: 'public' }));
-
+const frontendDistPath = path.resolve('omnirag-frontend/dist');
+app.use(express.static(frontendDistPath));
 /**
  * 1A. UI Endpoint for YouTube Ingestion (User-Scoped)
  */
@@ -259,6 +260,13 @@ app.post('/api/auth/login', async (req, res) => {
   } catch (err) {
     return res.status(401).json({ error: err.message });
   }
+});
+
+app.use((req, res, next) => {
+  if (req.method !== 'GET' || req.path.startsWith('/api') || req.path === '/health') {
+    return next();
+  }
+  return res.sendFile(path.join(frontendDistPath, 'index.html'));
 });
 
 // Server Runner & Automated Self-Test Mode (`node src/server.js --self-test`)
