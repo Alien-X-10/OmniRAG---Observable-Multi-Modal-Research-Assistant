@@ -4,6 +4,7 @@ import dotenv from 'dotenv';
 import { retrieveAndCompact } from '../retrieval/compactor.js';
 import { RAG_RESPONSE_SCHEMA, validateLLMOutput } from '../contracts/schema.js';
 import { closeDB } from '../config/db.js';
+import { runWithModelFallback } from '../services/geminiRetry.js';
 
 dotenv.config({ quiet: true });
 
@@ -16,7 +17,7 @@ const ai = new GoogleGenAI({
 
 const GENERATION_MODELS = [
   ...new Set([
-    process.env.GENERATION_MODEL || 'gemini-3.1-flash-lite',
+    process.env.GENERATION_MODEL || 'gemini-3.5-flash-lite',
     'gemini-3.5-flash-lite',
     'gemini-3.1-flash-lite',
     'gemini-2.5-flash',
@@ -38,21 +39,6 @@ STRICT GROUNDING & CITATION RULES:
 5. ABSTENTION PATH: If the provided <chunk> blocks are empty or do not explicitly contain the factual answer to the user's question, you MUST set "is_abstained": true, "answer": null, and "citations": [].`;
 
 /**
- * Detects temporary Gemini API high-demand / 503 availability spikes.
- */
-function isRetryable503(err) {
-  const status = err?.status ?? err?.code;
-  const msg = String(err?.message || '');
-  return (
-    status === 503 ||
-    msg.includes('503') ||
-    msg.includes('UNAVAILABLE') ||
-    msg.toLowerCase().includes('high demand') ||
-    msg.toLowerCase().includes('overloaded')
-  );
-}
-
-/**
  * Calculates estimated inference cost in USD from token counts.
  */
 function calculateCostUsd(promptTokens, candidateTokens) {
@@ -69,10 +55,11 @@ function calculateCostUsd(promptTokens, candidateTokens) {
  * @param {number} [options.topK=5] - Number of RRF candidates to retrieve
  * @param {string|null} [options.userId=null] - Authenticated user ID for corpus isolation
  * @param {function} [options.onStreamDelta] - Optional callback invoked on each streamed JSON chunk (used for SSE)
+ * @param {function} [options.onStreamReset] - Optional callback invoked when a partial stream resets before model fallback
  */
 export async function generateGroundedAnswer(
   query,
-  { topK = 5, userId = null, onStreamDelta = null } = {}
+  { topK = 5, userId = null, onStreamDelta = null, onStreamReset = null } = {}
 ) {
   const pipelineStartMs = performance.now();
 
@@ -116,13 +103,12 @@ export async function generateGroundedAnswer(
     };
   }
 
-  // 3. Stream Grounded JSON Response from Gemini (with Automatic 503 Fallback)
+  // 3. Stream Grounded JSON Response from Gemini (3.5 -> 3.1 -> 2.5 with 503 Fallback & Retry)
   let genStartMs = performance.now();
   let ttftMs = null;
   let accumulatedJsonText = '';
   let usageMetadata = null;
   let activeModel = GENERATION_MODELS[0];
-  let lastStreamErr = null;
 
   const prompt = `User Question: "${query}"
 
@@ -131,61 +117,56 @@ ${retrievalResult.formattedContext}
 
 Generate the strictly grounded JSON response following the required schema.`;
 
-  for (let i = 0; i < GENERATION_MODELS.length; i++) {
-    const modelName = GENERATION_MODELS[i];
-    activeModel = modelName;
-    genStartMs = performance.now();
-    ttftMs = null;
-    usageMetadata = null;
+  await runWithModelFallback({
+    label: 'Generator',
+    models: GENERATION_MODELS,
+    attemptFn: async (modelName) => {
+      activeModel = modelName;
+      genStartMs = performance.now();
+      ttftMs = null;
+      accumulatedJsonText = '';
+      usageMetadata = null;
+      let emittedDelta = false;
 
-    try {
-      const responseStream = await ai.models.generateContentStream({
-        model: modelName,
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        config: {
-          systemInstruction: SYSTEM_INSTRUCTION,
-          temperature: 0.0,
-          responseMimeType: 'application/json',
-          responseSchema: RAG_RESPONSE_SCHEMA,
-        },
-      });
+      try {
+        const responseStream = await ai.models.generateContentStream({
+          model: modelName,
+          contents: [{ role: 'user', parts: [{ text: prompt }] }],
+          config: {
+            systemInstruction: SYSTEM_INSTRUCTION,
+            temperature: 0.0,
+            responseMimeType: 'application/json',
+            responseSchema: RAG_RESPONSE_SCHEMA,
+          },
+        });
 
-      for await (const chunk of responseStream) {
-        if (ttftMs === null) {
-          ttftMs = Math.round(performance.now() - genStartMs);
-        }
+        for await (const chunk of responseStream) {
+          if (ttftMs === null) {
+            ttftMs = Math.round(performance.now() - genStartMs);
+          }
 
-        const deltaText = chunk.text || '';
-        if (deltaText) {
-          accumulatedJsonText += deltaText;
-          if (onStreamDelta) {
-            onStreamDelta(deltaText);
+          const deltaText = chunk.text || '';
+          if (deltaText) {
+            accumulatedJsonText += deltaText;
+            emittedDelta = true;
+            if (onStreamDelta) {
+              onStreamDelta(deltaText);
+            }
+          }
+
+          if (chunk.usageMetadata) {
+            usageMetadata = chunk.usageMetadata;
           }
         }
-
-        if (chunk.usageMetadata) {
-          usageMetadata = chunk.usageMetadata;
+      } catch (err) {
+        if (emittedDelta && onStreamReset) {
+          onStreamReset();
         }
-      }
-
-      lastStreamErr = null;
-      break;
-    } catch (err) {
-      lastStreamErr = err;
-      const hasFallback = i < GENERATION_MODELS.length - 1;
-      if (!isRetryable503(err) || !hasFallback || accumulatedJsonText.length > 0) {
+        accumulatedJsonText = '';
         throw err;
       }
-      console.warn(
-        `[Generator] ${modelName} returned 503 high demand; falling back to ${GENERATION_MODELS[i + 1]}...`
-      );
-      await new Promise((r) => setTimeout(r, 600));
-    }
-  }
-
-  if (lastStreamErr) {
-    throw lastStreamErr;
-  }
+    },
+  });
 
   const generationLatencyMs = Math.round(performance.now() - genStartMs);
   const totalLatencyMs = Math.round(performance.now() - pipelineStartMs);

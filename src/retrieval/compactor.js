@@ -3,6 +3,7 @@ import { GoogleGenAI, Type } from '@google/genai';
 import dotenv from 'dotenv';
 import { hybridRetrieve } from './hybridSearch.js';
 import { closeDB } from '../config/db.js';
+import { runWithModelFallback } from '../services/geminiRetry.js';
 
 dotenv.config({ quiet: true });
 
@@ -16,7 +17,7 @@ const ai = new GoogleGenAI({
 const RERANK_MODELS = [
   ...new Set([
     process.env.GENERATION_MODEL || 'gemini-3.5-flash-lite',
-    'gemini-3.1-flash-lite',
+    'gemini-3.5-flash-lite',
     'gemini-3.1-flash-lite',
     'gemini-2.5-flash',
   ]),
@@ -30,21 +31,6 @@ const SPOKEN_FILLER_PATTERNS = [
   /\b(so,?\s+as\s+you\s+can\s+see,?|now,?\s+let's\s+talk\s+about|moving\s+on\s+to)\b\s*/gi,
   /\b(in\s+order\s+to)\b/gi,
 ];
-
-/**
- * Detects temporary Gemini API high-demand / 503 availability spikes.
- */
-function isRetryable503(err) {
-  const status = err?.status ?? err?.code;
-  const msg = String(err?.message || '');
-  return (
-    status === 503 ||
-    msg.includes('503') ||
-    msg.includes('UNAVAILABLE') ||
-    msg.toLowerCase().includes('high demand') ||
-    msg.toLowerCase().includes('overloaded')
-  );
-}
 
 /**
  * Rough token estimator (~4 chars per token)
@@ -98,13 +84,11 @@ export async function crossEncodeRerank(query, candidateChunks) {
     content: c.content,
   }));
 
-  let response = null;
-  let lastErr = null;
-
-  for (let i = 0; i < RERANK_MODELS.length; i++) {
-    const modelName = RERANK_MODELS[i];
-    try {
-      response = await ai.models.generateContent({
+  const response = await runWithModelFallback({
+    label: 'Cross-Encoder',
+    models: RERANK_MODELS,
+    attemptFn: (modelName) =>
+      ai.models.generateContent({
         model: modelName,
         contents: [
           {
@@ -146,24 +130,8 @@ ${JSON.stringify(promptPayload, null, 2)}`,
             required: ['scores'],
           },
         },
-      });
-      break;
-    } catch (err) {
-      lastErr = err;
-      const hasFallback = i < RERANK_MODELS.length - 1;
-      if (!isRetryable503(err) || !hasFallback) {
-        throw err;
-      }
-      console.warn(
-        `[Cross-Encoder] ${modelName} returned 503 high demand; falling back to ${RERANK_MODELS[i + 1]}...`
-      );
-      await new Promise((r) => setTimeout(r, 600));
-    }
-  }
-
-  if (!response) {
-    throw lastErr;
-  }
+      }),
+  });
 
   const parsed = JSON.parse(response.text);
   const scoreMap = new Map(

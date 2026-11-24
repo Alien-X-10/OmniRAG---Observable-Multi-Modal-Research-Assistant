@@ -136,6 +136,7 @@ export function createVectorChunkDocument({
   content,
   embedding,
   tokenCount,
+  expiresAt = null,
 }) {
   const chunkId = `vid_${videoId}_${displayTimestamp}`;
 
@@ -164,5 +165,8 @@ export function createVectorChunkDocument({
     embedding,
     token_count: tokenCount,
     created_at: new Date(),
+    ...(expiresAt instanceof Date && !Number.isNaN(expiresAt.getTime())
+      ? { expires_at: expiresAt }
+      : {}),
   };
 }

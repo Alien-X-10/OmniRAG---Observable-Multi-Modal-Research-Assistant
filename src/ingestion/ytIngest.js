@@ -947,6 +947,7 @@ export async function ingestVideo({
   videoUrl,
   useMock = false,
   userId = 'system',
+  expiresAt = null,
   onProgress = null,
 }) {
   const ownerId = String(userId || 'system');
@@ -1047,6 +1048,7 @@ export async function ingestVideo({
         content: chunk.content,
         embedding: vectors[j],
         tokenCount: chunk.tokenCount,
+        expiresAt,
       });
 
       return {

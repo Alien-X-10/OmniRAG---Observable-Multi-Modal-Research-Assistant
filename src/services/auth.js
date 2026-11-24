@@ -1,8 +1,13 @@
 // File: src/services/auth.js
+import crypto from 'node:crypto';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import dotenv from 'dotenv';
-import { connectDB } from '../config/db.js';
+import {
+  connectDB,
+  getChunksCollection,
+  getTelemetryCollection,
+} from '../config/db.js';
 
 dotenv.config({ quiet: true });
 
@@ -10,6 +15,7 @@ const USERS_COLLECTION = 'users';
 const SALT_ROUNDS = 10;
 const JWT_SECRET = process.env.JWT_SECRET || 'omnirag-super-secret-jwt-key-2026';
 const JWT_EXPIRES_IN = '24h';
+const GUEST_TTL_MS = 24 * 60 * 60 * 1000;
 
 /**
  * Returns the MongoDB "users" collection and ensures a unique index on email.
@@ -161,6 +167,78 @@ export async function loginUser(email, password) {
   };
 }
 
+/**
+ * 2B. Create an Isolated Ephemeral Guest Session
+ * Mints a signed JWT with a unique guest_<uuid> tenant ID without writing to users.
+ */
+export function createGuestSession() {
+  const guestId = `guest_${crypto.randomUUID()}`;
+  const guestUsername = `guest_${guestId.slice(-6)}`;
+  const email = `${guestId}@guest.omnirag.internal`;
+
+  const token = jwt.sign(
+    {
+      userId: guestId,
+      email,
+      username: guestUsername,
+      isGuest: true,
+    },
+    JWT_SECRET,
+    { expiresIn: JWT_EXPIRES_IN }
+  );
+
+  const decoded = jwt.decode(token);
+  const expiresAt =
+    typeof decoded?.exp === 'number'
+      ? new Date(decoded.exp * 1000)
+      : new Date(Date.now() + GUEST_TTL_MS);
+
+  return {
+    email,
+    username: guestUsername,
+    token,
+    isGuest: true,
+    expiresAt: expiresAt.toISOString(),
+  };
+}
+
+/**
+ * Returns the 24h BSON Date expiration for guest sessions, or null for registered accounts.
+ */
+export function resolveTokenExpiresAt(user) {
+  if (!user?.isGuest) {
+    return null;
+  }
+  if (typeof user.exp === 'number') {
+    return new Date(user.exp * 1000);
+  }
+  return new Date(Date.now() + GUEST_TTL_MS);
+}
+
+/**
+ * Immediately removes all MongoDB chunks and telemetry traces owned by a guest session.
+ */
+export async function cleanupGuestSession(userId) {
+  const ownerId = typeof userId === 'string' ? userId.trim() : '';
+  if (!ownerId || !ownerId.startsWith('guest_')) {
+    throw new Error('Invalid guest session identifier.');
+  }
+
+  const [chunksCollection, telemetryCollection] = await Promise.all([
+    getChunksCollection(),
+    getTelemetryCollection(),
+  ]);
+
+  const [chunksResult, telemetryResult] = await Promise.all([
+    chunksCollection.deleteMany({ user_id: ownerId }),
+    telemetryCollection.deleteMany({ user_id: ownerId }),
+  ]);
+
+  return {
+    deleted_chunks: chunksResult.deletedCount || 0,
+    deleted_traces: telemetryResult.deletedCount || 0,
+  };
+}
 
 /**
  * 3. Express Middleware: Verify JWT Token
@@ -176,7 +254,14 @@ export function requireAuth(req, res, next) {
 
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
-    req.user = decoded; // Attaches { userId, email } to the request
+    if (
+      !decoded ||
+      typeof decoded.userId !== 'string' ||
+      decoded.userId.trim().length === 0
+    ) {
+      return res.status(401).json({ error: 'Unauthorized: Invalid or expired security token.' });
+    }
+    req.user = decoded; // Attaches { userId, email, username, isGuest } to the request
     return next();
   } catch (err) {
     return res.status(401).json({ error: 'Unauthorized: Invalid or expired security token.' });

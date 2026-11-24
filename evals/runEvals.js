@@ -1,4 +1,8 @@
 // File: evals/runEvals.js
+import { setDefaultResultOrder } from 'node:dns';
+import { setDefaultAutoSelectFamily } from 'node:net';
+setDefaultResultOrder('ipv4first');
+setDefaultAutoSelectFamily(false);
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';

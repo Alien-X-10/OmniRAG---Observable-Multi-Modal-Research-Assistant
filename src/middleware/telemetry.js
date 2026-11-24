@@ -1,8 +1,6 @@
 // File: src/middleware/telemetry.js
 import crypto from 'node:crypto';
-import { connectDB } from '../config/db.js';
-
-const TELEMETRY_COLLECTION = 'telemetry_logs';
+import { getTelemetryCollection } from '../config/db.js';
 const recentTracesBuffer = [];
 const MAX_BUFFER_SIZE = 50;
 
@@ -77,9 +75,23 @@ export function telemetryMiddleware(req, res, next) {
 /**
  * Persists a completed RAG execution trace to MongoDB and the in-memory ring buffer.
  */
+function emptyTelemetrySummary() {
+  return {
+    total_requests: 0,
+    abstention_rate: 0,
+    avg_ttft_ms: 0,
+    avg_total_latency_ms: 0,
+    total_tokens_consumed: 0,
+    total_tokens_saved_by_compaction: 0,
+    cumulative_cost_usd: 0,
+    recent_traces: [],
+  };
+}
+
 export async function recordQueryTelemetry({
   requestId,
   userId = null,
+  expiresAt = null,
   query,
   output,
   telemetry,
@@ -108,6 +120,9 @@ export async function recordQueryTelemetry({
       compaction_saved: telemetry.compactionMetrics?.tokensSaved || 0,
     },
     estimated_cost_usd: telemetry.estimatedCostUsd,
+    ...(expiresAt instanceof Date && !Number.isNaN(expiresAt.getTime())
+      ? { expires_at: expiresAt }
+      : {}),
   };
 
   recentTracesBuffer.unshift(traceDoc);
@@ -116,8 +131,8 @@ export async function recordQueryTelemetry({
   }
 
   try {
-    const db = await connectDB();
-    await db.collection(TELEMETRY_COLLECTION).insertOne(traceDoc);
+    const collection = await getTelemetryCollection();
+    await collection.insertOne(traceDoc);
   } catch (err) {
     console.warn(`[Telemetry] Failed to persist trace to MongoDB: ${err.message}`);
   }
@@ -131,11 +146,13 @@ export const logTelemetryTrace = recordQueryTelemetry;
  * Aggregates observability metrics from MongoDB scoped to a specific userId.
  */
 export async function getTelemetrySummary(userId = null) {
-  const db = await connectDB();
-  const collection = db.collection(TELEMETRY_COLLECTION);
+  const ownerId = typeof userId === 'string' ? userId.trim() : '';
+  if (!ownerId) {
+    return emptyTelemetrySummary();
+  }
 
-  // Scope query strictly to the authenticated user when userId is provided
-  const filter = userId ? { user_id: userId } : {};
+  const collection = await getTelemetryCollection();
+  const filter = { user_id: ownerId };
 
   const traces = await collection
     .find(filter, { projection: { _id: 0 } })
@@ -144,16 +161,7 @@ export async function getTelemetrySummary(userId = null) {
     .toArray();
 
   if (traces.length === 0) {
-    return {
-      total_requests: 0,
-      abstention_rate: 0,
-      avg_ttft_ms: 0,
-      avg_total_latency_ms: 0,
-      total_tokens_consumed: 0,
-      total_tokens_saved_by_compaction: 0,
-      cumulative_cost_usd: 0,
-      recent_traces: [],
-    };
+    return emptyTelemetrySummary();
   }
 
   let abstainedCount = 0;

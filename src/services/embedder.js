@@ -1,6 +1,7 @@
 // File: src/services/embedder.js
 import { GoogleGenAI } from '@google/genai';
 import dotenv from 'dotenv';
+import { retryOn503 } from './geminiRetry.js';
 
 dotenv.config();
 
@@ -27,14 +28,16 @@ const EMBEDDING_MODEL = 'gemini-embedding-001';
  * @returns {Promise<number[]>} 768-dimensional float vector
  */
 export async function embedDocumentChunk(text, title = '') {
-  const response = await ai.models.embedContent({
-    model: EMBEDDING_MODEL,
-    contents: text,
-    config: {
-      taskType: 'RETRIEVAL_DOCUMENT',
-      title: title || undefined,
-    },
-  });
+  const response = await retryOn503('Embedder:Doc', () =>
+    ai.models.embedContent({
+      model: EMBEDDING_MODEL,
+      contents: text,
+      config: {
+        taskType: 'RETRIEVAL_DOCUMENT',
+        title: title || undefined,
+      },
+    })
+  );
 
   const values = response?.embeddings?.[0]?.values;
   if (!values || values.length === 0) {
@@ -51,13 +54,15 @@ export async function embedDocumentChunk(text, title = '') {
  * @returns {Promise<number[]>} 768-dimensional float vector
  */
 export async function embedSearchQuery(query) {
-  const response = await ai.models.embedContent({
-    model: EMBEDDING_MODEL,
-    contents: query,
-    config: {
-      taskType: 'RETRIEVAL_QUERY',
-    },
-  });
+  const response = await retryOn503('Embedder:Query', () =>
+    ai.models.embedContent({
+      model: EMBEDDING_MODEL,
+      contents: query,
+      config: {
+        taskType: 'RETRIEVAL_QUERY',
+      },
+    })
+  );
 
   const values = response?.embeddings?.[0]?.values;
   if (!values || values.length === 0) {

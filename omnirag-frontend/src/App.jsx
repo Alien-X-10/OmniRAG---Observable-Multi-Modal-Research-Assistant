@@ -16,6 +16,9 @@ export default function App() {
   const [username, setUsername] = useState(
     () => localStorage.getItem('omnirag_user') || ''
   );
+  const [isGuest, setIsGuest] = useState(
+    () => localStorage.getItem('omnirag_is_guest') === 'true'
+  );
   const [activeTab, setActiveTab] = useState('chat');
   const [isIngestOpen, setIsIngestOpen] = useState(false);
   const [isAuthOpen, setIsAuthOpen] = useState(false);
@@ -52,6 +55,15 @@ export default function App() {
         },
       });
 
+      if (res.status === 401) {
+        localStorage.removeItem('omnirag_user');
+        localStorage.removeItem('omnirag_token');
+        localStorage.removeItem('omnirag_is_guest');
+        setUsername('');
+        setIsGuest(false);
+        return;
+      }
+
       if (!res.ok) return;
       const data = await res.json();
       setTelemetry(data);
@@ -64,19 +76,43 @@ export default function App() {
     fetchTelemetry();
   }, [fetchTelemetry]);
 
-  const handleSignIn = (displayUsername, token = '') => {
+  const handleSignIn = (displayUsername, token = '', isGuestSession = false) => {
     if (token) {
       localStorage.setItem('omnirag_token', token);
     }
     localStorage.setItem('omnirag_user', displayUsername);
+    if (isGuestSession) {
+      localStorage.setItem('omnirag_is_guest', 'true');
+    } else {
+      localStorage.removeItem('omnirag_is_guest');
+    }
+    setIsGuest(Boolean(isGuestSession));
     setUsername(displayUsername);
     setMessages([]);
     fetchTelemetry(token);
   };
 
-  const handleLogoutOrSignInClick = () => {
+  const handleLogoutOrSignInClick = async () => {
+    const token = localStorage.getItem('omnirag_token') || '';
+    const wasGuest =
+      isGuest || localStorage.getItem('omnirag_is_guest') === 'true';
+
+    if (wasGuest && token) {
+      try {
+        await fetch('/api/auth/guest', {
+          method: 'DELETE',
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        });
+      } catch {
+        // Best-effort immediate cleanup; 24h MongoDB TTL handles expired docs automatically
+      }
+    }
+
     handleDismissIngestJob();
     setUsername('');
+    setIsGuest(false);
     setMessages([]);
     setTelemetry({
       total_requests: 0,
@@ -90,6 +126,7 @@ export default function App() {
     });
     localStorage.removeItem('omnirag_user');
     localStorage.removeItem('omnirag_token');
+    localStorage.removeItem('omnirag_is_guest');
     setIsAuthOpen(false);
   };
 
@@ -109,6 +146,7 @@ export default function App() {
       heading: 'Assistant: Grounded RAG synthesis:',
       rawStream: '',
       answer: null,
+      error: null,
       isAbstained: false,
       abstainReason: '',
       systemLogs: ['System output: Hybrid RRF + Cross-Encoder gate active...'],
@@ -155,6 +193,12 @@ export default function App() {
 
           const eventType = eventLine.replace('event:', '').trim();
           const payload = JSON.parse(dataLine.replace('data:', '').trim());
+
+          if (eventType === 'reset') {
+            setMessages((prev) =>
+              prev.map((m) => (m.id === msgId ? { ...m, rawStream: '' } : m))
+            );
+          }
 
           if (eventType === 'delta' && payload.chunk) {
             setMessages((prev) =>
@@ -215,8 +259,8 @@ export default function App() {
           m.id === msgId
             ? {
                 ...m,
-                isAbstained: true,
-                abstainReason: `System Abstained: ${err.message}`,
+                isAbstained: false,
+                error: err.message || 'Failed to reach generation backend.',
                 systemLogs: [`System output: Error: ${err.message}`],
               }
             : m
@@ -278,7 +322,11 @@ export default function App() {
     return (
       <Login
         onLoginSuccess={(userData) =>
-          handleSignIn(userData.username || userData.email, userData.token)
+          handleSignIn(
+            userData.username || userData.email,
+            userData.token,
+            Boolean(userData.isGuest)
+          )
         }
       />
     );
@@ -289,6 +337,7 @@ export default function App() {
       {/* Top-Left Project Branding, Active Username & Logout */}
       <ProjectBrandHeader
         username={username}
+        isGuest={isGuest}
         onLogoutClick={handleLogoutOrSignInClick}
       />
 

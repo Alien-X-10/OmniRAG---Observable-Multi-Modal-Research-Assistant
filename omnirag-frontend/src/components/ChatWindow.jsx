@@ -115,7 +115,9 @@ export default function ChatWindow({ messages, isStreaming }) {
                   </pre>
                 ) : (
                <div className="whitespace-pre-wrap font-sans text-sm text-gray-100 leading-relaxed">
-                 {msg.isAbstained
+                 {msg.error
+                   ? 'Upstream API Error: Unable to generate grounded response right now. Please try again.'
+                   : msg.isAbstained
                    ? 'Abstained: Search parameters unmet in ingested video corpus.'
                    : msg.answer
                    ? msg.answer.replace(/<chunk id="([^"]+)">/g, '[$1]')
@@ -152,8 +154,28 @@ export default function ChatWindow({ messages, isStreaming }) {
                 </div>
               )}
 
+              {/* Error Banner for Upstream API / Network Failures */}
+              {msg.error && (
+                <div className="flex items-center gap-2.5 px-4 py-2.5 rounded-lg bg-red-950/50 border border-red-500/60 text-red-300 text-xs sm:text-sm">
+                  <svg
+                    className="w-4 h-4 shrink-0 text-red-400"
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth={2}
+                      d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
+                    />
+                  </svg>
+                  <span className="break-all">API Error: {msg.error}</span>
+                </div>
+              )}
+
               {/* Amber Warning Box for Abstention */}
-              {msg.isAbstained && (
+              {!msg.error && msg.isAbstained && (
                 <div className="flex items-center gap-2.5 px-4 py-2.5 rounded-lg bg-abstain-bg border border-abstain-border text-abstain-text text-xs sm:text-sm">
                   <svg
                     className="w-4 h-4 shrink-0 text-abstain-text"

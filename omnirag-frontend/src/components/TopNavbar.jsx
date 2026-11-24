@@ -4,15 +4,22 @@ import React from 'react';
 /**
  * Top-left project title & active username bar above the main glowing frame
  */
-export function ProjectBrandHeader({ username, onLogoutClick }) {
+export function ProjectBrandHeader({ username, isGuest = false, onLogoutClick }) {
   return (
     <div className="w-full max-w-[1600px] mb-2.5 px-1 flex items-center justify-between select-none">
       <div>
         <h1 className="text-lg sm:text-2xl font-medium text-gray-200 tracking-tight">
           OmniRAG - Observable Multi-Modal Research Assistant
         </h1>
-        <p className="text-xs sm:text-sm text-gray-500 font-mono mt-0.5">
-          user: <span className="text-gray-400">{username || 'guest'}</span>
+        <p className="text-xs sm:text-sm text-gray-500 font-mono mt-0.5 flex items-center gap-2">
+          <span>
+            user: <span className="text-gray-400">{username || 'guest'}</span>
+          </span>
+          {isGuest && (
+            <span className="px-2 py-0.5 rounded-full text-[10px] bg-amber-500/10 border border-amber-500/40 text-amber-300">
+              GUEST · 24H TEMP
+            </span>
+          )}
         </p>
       </div>
 

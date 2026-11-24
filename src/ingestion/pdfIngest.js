@@ -309,6 +309,7 @@ export async function ingestPdf({
   customTitle = null,
   useMock = false,
   userId = 'system',
+  expiresAt = null,
   onProgress = null,
 } = {}) {
   const ownerId = String(userId || 'system');
@@ -437,6 +438,7 @@ export async function ingestPdf({
         content: chunk.content,
         embedding: vectors[j],
         tokenCount: chunk.tokenCount,
+        expiresAt,
       });
 
       return {

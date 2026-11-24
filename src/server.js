@@ -15,9 +15,22 @@ import {
   recordQueryTelemetry,
   getTelemetrySummary,
 } from './middleware/telemetry.js';
-import { connectDB, closeDB, getChunksCollection } from './config/db.js';
+import {
+  connectDB,
+  closeDB,
+  getChunksCollection,
+  ensureStandardIndexes,
+  ensureTelemetryIndexes,
+} from './config/db.js';
 
-import { registerUser, loginUser, requireAuth } from './services/auth.js';
+import {
+  registerUser,
+  loginUser,
+  createGuestSession,
+  cleanupGuestSession,
+  resolveTokenExpiresAt,
+  requireAuth,
+} from './services/auth.js';
 import path from 'node:path';
 
 import { ingestVideo } from './ingestion/ytIngest.js';
@@ -68,12 +81,13 @@ app.post('/api/ingest', requireAuth, async (req, res) => {
     }
 
     const userId = String(req.user.userId);
+    const expiresAt = resolveTokenExpiresAt(req.user);
     const job = startIngestJob({
       userId,
       type: 'youtube',
       initialTitle: 'YouTube Lecture',
       runner: (onProgress) =>
-        ingestVideo({ videoUrl, useMock: false, userId, onProgress }),
+        ingestVideo({ videoUrl, useMock: false, userId, expiresAt, onProgress }),
     });
 
     return res.status(202).json({
@@ -96,6 +110,7 @@ app.post('/api/ingest/pdf', requireAuth, upload.single('file'), async (req, res)
     }
 
     const userId = String(req.user.userId);
+    const expiresAt = resolveTokenExpiresAt(req.user);
     const fileBuffer = req.file.buffer;
     const originalName = req.file.originalname || 'Document.pdf';
     const customTitle = req.body?.title || null;
@@ -111,6 +126,7 @@ app.post('/api/ingest/pdf', requireAuth, upload.single('file'), async (req, res)
           customTitle,
           useMock: false,
           userId,
+          expiresAt,
           onProgress,
         }),
     });
@@ -220,6 +236,7 @@ app.post('/api/query/stream', requireAuth, async (req, res) => {
 
   const requestId = req.requestId || crypto.randomUUID();
   const userId = req.user?.userId ? String(req.user.userId) : null;
+  const expiresAt = resolveTokenExpiresAt(req.user);
   sendSseEvent(res, 'meta', { request_id: requestId, status: 'streaming_started' });
 
   try {
@@ -227,11 +244,13 @@ app.post('/api/query/stream', requireAuth, async (req, res) => {
       topK,
       userId,
       onStreamDelta: (chunk) => sendSseEvent(res, 'delta', { chunk }),
+      onStreamReset: () => sendSseEvent(res, 'reset', { request_id: requestId }),
     });
 
     const savedTrace = await recordQueryTelemetry({
       requestId,
       userId,
+      expiresAt,
       userEmail: req.user?.email || null,
       query: query.trim(),
       output: result.output,
@@ -399,6 +418,38 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
+/**
+ * 9. POST /api/auth/guest
+ * Issues a real, isolated 24h JWT for an ephemeral guest session.
+ */
+app.post('/api/auth/guest', (req, res) => {
+  try {
+    const session = createGuestSession();
+    return res.status(201).json(session);
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * 10. DELETE /api/auth/guest
+ * Immediately clears chunks and telemetry traces for the authenticated guest session.
+ */
+app.delete('/api/auth/guest', requireAuth, async (req, res) => {
+  try {
+    if (!req.user?.isGuest) {
+      return res.status(403).json({
+        error: 'Forbidden: Only ephemeral guest sessions can be purged via this endpoint.',
+      });
+    }
+
+    const cleanup = await cleanupGuestSession(req.user.userId);
+    return res.status(200).json({ cleared: true, ...cleanup });
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+});
+
 app.use((req, res, next) => {
   if (req.method !== 'GET' || req.path.startsWith('/api') || req.path === '/health') {
     return next();
@@ -413,6 +464,7 @@ if (process.argv[1] && process.argv[1].endsWith('server.js')) {
 
   (async () => {
     await connectDB();
+    await Promise.all([ensureStandardIndexes(), ensureTelemetryIndexes()]);
 
     const server = app.listen(PORT, async () => {
       console.log(`[Server] OmniRAG SSE API listening on http://localhost:${PORT}`);

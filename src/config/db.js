@@ -18,6 +18,7 @@ dotenv.config({ quiet: true });
 const uri = process.env.MONGODB_URI;
 const dbName = process.env.DB_NAME || 'omnirag';
 const collectionName = process.env.COLLECTION_NAME || 'video_chunks';
+const telemetryCollectionName = 'telemetry_logs';
 
 if (!uri) {
   throw new Error('Missing MONGODB_URI in .env file.');
@@ -81,8 +82,15 @@ export async function getChunksCollection() {
 }
 
 /**
- * Creates per-user B-Tree compound indexes to guarantee tenant-isolated upserts
- * and fast filtering by user_id and video_id.
+ * Returns the target collection for storing per-request RAG telemetry traces.
+ */
+export async function getTelemetryCollection() {
+  const db = await connectDB();
+  return db.collection(telemetryCollectionName);
+}
+
+/**
+ * Creates per-user B-Tree compound indexes and 24h guest TTL index on video_chunks.
  */
 export async function ensureStandardIndexes() {
   const collection = await getChunksCollection();
@@ -100,7 +108,22 @@ export async function ensureStandardIndexes() {
   // Speed up per-user corpus listing, retrieval filtering, and deletion
   await collection.createIndex({ user_id: 1, 'video_metadata.video_id': 1 });
 
-  console.log(`[MongoDB] Verified per-user compound indexes in "${collectionName}"`);
+  // Automatically purge expired guest documents (registered user docs omit expires_at)
+  await collection.createIndex({ expires_at: 1 }, { expireAfterSeconds: 0 });
+
+  console.log(`[MongoDB] Verified per-user compound & TTL indexes in "${collectionName}"`);
+}
+
+/**
+ * Creates per-user query history index and 24h guest TTL index on telemetry_logs.
+ */
+export async function ensureTelemetryIndexes() {
+  const collection = await getTelemetryCollection();
+
+  await collection.createIndex({ user_id: 1, timestamp: -1 });
+  await collection.createIndex({ expires_at: 1 }, { expireAfterSeconds: 0 });
+
+  console.log(`[MongoDB] Verified query & TTL indexes in "${telemetryCollectionName}"`);
 }
 
 /**
