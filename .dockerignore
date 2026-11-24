@@ -1,0 +1,11 @@
+node_modules
+omnirag-frontend/node_modules
+omnirag-frontend/dist
+.env
+.env.*
+cookies.txt
+.git
+*.log
+voice-service/.venv
+voice-service/__pycache__
+voice-service/.pytest_cache

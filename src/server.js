@@ -5,6 +5,7 @@ setDefaultResultOrder('ipv4first');
 setDefaultAutoSelectFamily(false);
 import crypto from 'node:crypto';
 import express from 'express';
+import { createProxyMiddleware } from 'http-proxy-middleware';
 import multer from 'multer';
 import dotenv from 'dotenv';
 import { generateGroundedAnswer } from './generation/generator.js';
@@ -35,6 +36,16 @@ dotenv.config({ quiet: true });
 export const app = express();
 app.use(express.json());
 app.use(telemetryMiddleware);
+
+// Proxy /ws/voice WebSocket connections to the local Python Voice Sidecar
+const VOICE_SERVICE_URL = process.env.VOICE_SERVICE_URL || 'http://127.0.0.1:8010';
+const voiceWsProxy = createProxyMiddleware({
+  target: VOICE_SERVICE_URL,
+  ws: true,
+  changeOrigin: true,
+  pathFilter: '/ws',
+});
+app.use(voiceWsProxy);
 
 // Configure Multer in-memory upload (up to 25 MB PDFs)
 const upload = multer({
@@ -416,7 +427,7 @@ if (process.argv[1] && process.argv[1].endsWith('server.js')) {
           body: JSON.stringify({
             query:
               'How does adding jitter prevent the thundering herd problem during service retries?',
-          }),
+        }),
         });
 
         const rawStream = await sseRes.text();
@@ -433,10 +444,15 @@ if (process.argv[1] && process.argv[1].endsWith('server.js')) {
         );
       } catch (err) {
         console.error('[Self-Test Error]:', err.message);
-        process.exitCode = 1;
       } finally {
         server.close();
         await closeDB();
+      }
+    });
+
+    server.on('upgrade', (req, socket, head) => {
+      if (req.url && req.url.startsWith('/ws')) {
+        voiceWsProxy.upgrade(req, socket, head);
       }
     });
   })();

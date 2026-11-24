@@ -6,11 +6,13 @@ RUN npm ci
 COPY omnirag-frontend/ ./
 RUN npm run build
 
-# Stage 2: Production Backend + Media Tools + Built Frontend
+# Stage 2: Production Backend + Python Voice Sidecar + Media Tools + Built Frontend
 FROM node:22-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
+    python3-venv \
+    python3-pip \
     ffmpeg \
     curl \
     ca-certificates \
@@ -20,12 +22,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
+# Install Node.js production dependencies
 COPY package*.json ./
 RUN npm ci --omit=dev
 
+# Install Python Voice Sidecar dependencies in an isolated Linux venv
+COPY voice-service/requirements.txt ./voice-service/requirements.txt
+RUN python3 -m venv /app/voice-service/.venv \
+  && /app/voice-service/.venv/bin/pip install --no-cache-dir --upgrade pip \
+  && /app/voice-service/.venv/bin/pip install --no-cache-dir -r /app/voice-service/requirements.txt
+
+# Copy application source & compiled frontend
 COPY . .
 COPY --from=frontend-builder /app/omnirag-frontend/dist ./omnirag-frontend/dist
 
+# Strip Windows CRLF line endings from start.sh and make it executable
+RUN sed -i 's/\r$//' /app/start.sh && chmod +x /app/start.sh
+
 EXPOSE 3000
 
-CMD ["node", "src/server.js"]
+CMD ["/app/start.sh"]
