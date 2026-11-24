@@ -139,6 +139,38 @@ export default function WorkspaceNavbar({
             <span className="absolute -bottom-[11px] left-2 right-2 h-[2px] bg-neon-400 rounded-full shadow-[0_0_12px_#34d399,0_0_20px_#10b981]" />
           )}
         </div>
+        {/* Voice Live Button */}
+        <div className="relative flex items-center">
+          <button
+            type="button"
+            onClick={() => setActiveTab('voice')}
+            className={`flex items-center gap-1.5 px-3.5 py-1 rounded-full text-xs font-medium transition-all ${
+              activeTab === 'voice'
+                ? 'bg-neon-500/20 text-neon-400 border border-neon-500/50 shadow-[0_0_15px_rgba(16,185,129,0.25)]'
+                : 'text-gray-400 hover:text-gray-200'
+            }`}
+          >
+            {/* Microphone Icon */}
+            <svg
+              className="w-3.5 h-3.5"
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth={2}
+                d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z"
+              />
+            </svg>
+            <span>Voice Live</span>
+          </button>
+
+          {activeTab === 'voice' && (
+            <span className="absolute -bottom-[11px] left-2 right-2 h-[2px] bg-neon-400 rounded-full shadow-[0_0_12px_#34d399,0_0_20px_#10b981]" />
+          )}
+        </div>
       </nav>
 
       {/* Far Right: Logout / Sign In Button */}

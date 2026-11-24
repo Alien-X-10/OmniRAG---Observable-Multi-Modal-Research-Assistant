@@ -4,39 +4,22 @@ import TelemetrySidebar from './components/TelemetrySidebar';
 import WorkspaceNavbar, { ProjectBrandHeader } from './components/TopNavbar';
 import ChatWindow from './components/ChatWindow';
 import CommandInput from './components/CommandInput';
-import { AuthModal, IngestModal } from './components/Modals';
+import { AuthModal, IngestModal, IngestProgressPill } from './components/Modals';
 import { HistoryView, AboutView } from './components/WorkspaceViews';
 import Login from './components/Login';
+import VoicePanel from './components/VoicePanel';
+import { useIngestJob } from './hooks/useIngestJob';
 
-const INITIAL_MESSAGES = [
-  // {
-  //   id: 'welcome-1',
-  //   question: 'hi',
-  //   heading: 'Assistant: Grounded RAG synthesis:',
-  //   isAbstained: true,
-  //   abstainReason: 'System Abstained: Search parameters unmet.',
-  //   systemLogs: [
-  //     'System output: Model: gemini-3.1-flash-lite | TTFT: 0 ms',
-  //     'System output: Tokens Consumed: 0 | Compaction Saved: 0',
-  //     'System mattes: Abstained: Search parameters unmet.',
-  //   ],
-  //   citations: [],
-  // },
-];
+const INITIAL_MESSAGES = [];
 
 export default function App() {
-  // const [username, setUsername] = useState(
-  //   () => localStorage.getItem('omnirag_user') || 'jeff_brokaw'
-  // );
-  // Replace your current useState with this:
-const [username, setUsername] = useState(
-  () => localStorage.getItem('omnirag_user') || ''
-);
+  const [username, setUsername] = useState(
+    () => localStorage.getItem('omnirag_user') || ''
+  );
   const [activeTab, setActiveTab] = useState('chat');
   const [isIngestOpen, setIsIngestOpen] = useState(false);
   const [isAuthOpen, setIsAuthOpen] = useState(false);
 
-  // const [telemetry, setTelemetry] = useState(null);
   const [telemetry, setTelemetry] = useState({
     total_requests: 0,
     abstention_rate: 0,
@@ -51,28 +34,15 @@ const [username, setUsername] = useState(
   const [query, setQuery] = useState('');
   const [isStreaming, setIsStreaming] = useState(false);
 
-  // const fetchTelemetry = useCallback(async () => {
-  //   try {
-  //     // 1. Get the token from local storage
-  //     const token = localStorage.getItem('omnirag_token') || '';
-
-  //     const res = await fetch('/api/telemetry/summary', {
-  //       headers: {
-  //         Authorization: `Bearer ${token}`,
-  //       },
-  //     });
-
-  //     if (!res.ok) return;
-  //     const data = await res.json();
-  //     setTelemetry(data);
-  //   } catch {
-  //     // Keeps fallback metrics if backend is offline
-  //   }
-  // }, []);
+  // Background ingestion job tracker (auto-recovers on refresh, clears on logout)
+  const {
+    activeJob: activeIngestJob,
+    startTrackingJob: handleStartIngestJob,
+    dismissJob: handleDismissIngestJob,
+  } = useIngestJob(Boolean(username));
 
   const fetchTelemetry = useCallback(async (overrideToken = null) => {
     try {
-      // 1. Use the freshly passed login token first, otherwise read from local storage
       const token = overrideToken || localStorage.getItem('omnirag_token') || '';
       if (!token) return;
 
@@ -94,36 +64,18 @@ const [username, setUsername] = useState(
     fetchTelemetry();
   }, [fetchTelemetry]);
 
-  // const handleSignIn = (newUsername, token = '') => {
-  //   setUsername(newUsername);
-  //   localStorage.setItem('omnirag_user', newUsername);
-  //   if (token) {
-  //     localStorage.setItem('omnirag_token', token);
-  //   }
-  // };
-
-  // const handleLogoutOrSignInClick = () => {
-  //   if (username) {
-  //     setUsername('');
-  //     localStorage.removeItem('omnirag_user');
-  //     localStorage.removeItem('omnirag_token');
-  //     setIsAuthOpen(true);
-  //   } else {
-  //     setIsAuthOpen(true);
-  //   }
-  // };
-
   const handleSignIn = (displayUsername, token = '') => {
-    setUsername(displayUsername);
-    localStorage.setItem('omnirag_user', displayUsername);
     if (token) {
       localStorage.setItem('omnirag_token', token);
     }
+    localStorage.setItem('omnirag_user', displayUsername);
+    setUsername(displayUsername);
     setMessages([]);
     fetchTelemetry(token);
   };
 
   const handleLogoutOrSignInClick = () => {
+    handleDismissIngestJob();
     setUsername('');
     setMessages([]);
     setTelemetry({
@@ -138,10 +90,8 @@ const [username, setUsername] = useState(
     });
     localStorage.removeItem('omnirag_user');
     localStorage.removeItem('omnirag_token');
-    // setIsAuthOpen(true);
     setIsAuthOpen(false);
   };
-
 
   const handleSendQuery = async (overrideQuery = null) => {
     const rawQuery = typeof overrideQuery === 'string' ? overrideQuery : query;
@@ -170,14 +120,13 @@ const [username, setUsername] = useState(
     setIsStreaming(true);
 
     try {
-      // 1.  Get the token from local storage
-const token = localStorage.getItem('omnirag_token') || '';
+      const token = localStorage.getItem('omnirag_token') || '';
       const response = await fetch('/api/query/stream', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}` 
-         },
-        
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
         body: JSON.stringify({ query: trimmed, topK: 5 }),
       });
 
@@ -278,19 +227,9 @@ const token = localStorage.getItem('omnirag_token') || '';
     }
   };
 
-  // Paste this right above your main return (...)
-// if (!username) {
-//     return (
-//       <Login 
-//         onLoginSuccess={(userData) => handleSignIn(userData.email, userData.token)} 
-//       />
-//     );
-//   }
-
-const handleLoadTrace = (trace) => {
+  const handleLoadTrace = (trace) => {
     if (!trace) return;
 
-    // Check if the answer was already generated in the current browser session
     const sessionMatch = messages.find(
       (m) => m.question === trace.query && (m.answer || m.isAbstained)
     );
@@ -300,7 +239,6 @@ const handleLoadTrace = (trace) => {
         ? trace.citations
         : sessionMatch?.citations || [];
 
-    // If an older trace in MongoDB was logged before `answer` was stored, auto-run it once
     if (!trace.is_abstained && !resolvedAnswer) {
       setActiveTab('chat');
       handleSendQuery(trace.query);
@@ -336,53 +274,7 @@ const handleLoadTrace = (trace) => {
     setActiveTab('chat');
   };
 
-// const handleLoadTrace = (trace) => {
-//     if (!trace) return;
-
-//     const sessionMatch = messages.find(
-//       (m) => m.question === trace.query && (m.answer || m.isAbstained)
-//     );
-
-//     const resolvedAnswer =
-//       trace.answer ||
-//       sessionMatch?.answer ||
-//       'No saved answer text was stored for this older trace. Click "↻ Re-run" on the History card to generate a fresh answer.';
-
-//     const resolvedCitations =
-//       trace.citations?.length > 0
-//         ? trace.citations
-//         : sessionMatch?.citations || [];
-
-//     const loadedMsg = {
-//       id: `history-${trace.request_id || Date.now()}`,
-//       question: trace.query,
-//       heading: 'Assistant: Grounded RAG synthesis (Loaded from History):',
-//       rawStream: '',
-//       answer: resolvedAnswer,
-//       isAbstained: Boolean(trace.is_abstained),
-//       abstainReason: 'System Abstained: Search parameters unmet.',
-//       citations: resolvedCitations,
-//       systemLogs: [
-//         `System output: Model: ${trace.model || 'gemini-2.5-flash'} | TTFT: ${
-//           trace.latency_ms?.ttft ?? 0
-//         } ms`,
-//         `System output: Tokens Consumed: ${
-//           trace.tokens?.total ?? 0
-//         } | Compaction Saved: ${trace.tokens?.compaction_saved ?? 0}`,
-//         trace.is_abstained
-//           ? 'System mattes: Abstained: Search parameters unmet.'
-//           : `System output: Verified ${resolvedCitations.length} inline citation(s).`,
-//       ],
-//     };
-
-//     setMessages((prev) => [
-//       ...prev.filter((m) => m.id !== loadedMsg.id),
-//       loadedMsg,
-//     ]);
-//     setActiveTab('chat');
-//   };
-
-if (!username) {
+  if (!username) {
     return (
       <Login
         onLoginSuccess={(userData) =>
@@ -394,9 +286,7 @@ if (!username) {
 
   return (
     <div className="min-h-screen w-screen bg-midnight-950 flex flex-col items-center justify-center p-3 sm:p-6">
-      {/* Top-Left Project Branding & Active Username */}
-      {/* <ProjectBrandHeader username={username} /> */}
-
+      {/* Top-Left Project Branding, Active Username & Logout */}
       <ProjectBrandHeader
         username={username}
         onLogoutClick={handleLogoutOrSignInClick}
@@ -409,35 +299,16 @@ if (!username) {
 
         {/* Right Column: Top Navbar + Active View + Bottom Command Bar */}
         <main className="flex-1 flex flex-col min-w-0 bg-midnight-900">
-          {/* <WorkspaceNavbar
+          <WorkspaceNavbar
             activeTab={activeTab}
             setActiveTab={setActiveTab}
             onOpenIngest={() => setIsIngestOpen(true)}
             chatCount={messages.length}
-            username={username}
-            onLogoutClick={handleLogoutOrSignInClick}
-          /> */}
-          <WorkspaceNavbar
-        activeTab={activeTab}
-        setActiveTab={setActiveTab}
-        onOpenIngest={() => setIsIngestOpen(true)}
-        chatCount={messages.length}
-      />
+          />
 
           {activeTab === 'chat' && (
             <ChatWindow messages={messages} isStreaming={isStreaming} />
           )}
-
-          {/* {activeTab === 'history' && (
-            <HistoryView
-              telemetry={telemetry}
-              messages={messages}
-              onSelectQuery={(selectedQuery) => {
-                setQuery(selectedQuery);
-                setActiveTab('chat');
-              }}
-            />
-          )} */}
 
           {activeTab === 'history' && (
             <HistoryView
@@ -451,19 +322,10 @@ if (!username) {
             />
           )}
 
-          {/* {activeTab === 'about' && <AboutView />}
+          {activeTab === 'about' && <AboutView />}
+          {activeTab === 'voice' && <VoicePanel />}
 
-          <CommandInput
-            query={query}
-            setQuery={setQuery}
-            onSubmit={handleSendQuery}
-            isStreaming={isStreaming}
-          />
-        </main> */}
-
-        {activeTab === 'about' && <AboutView />}
-
-          {activeTab === 'chat' && (
+          {activeTab !== 'voice' && (
             <CommandInput
               query={query}
               setQuery={setQuery}
@@ -474,11 +336,21 @@ if (!username) {
         </main>
       </div>
 
-      {/* + Ingest YouTube Modal */}
+      {/* + Ingest YouTube / PDF Modal (with Live Progress & Run in Background) */}
       <IngestModal
         isOpen={isIngestOpen}
         onClose={() => setIsIngestOpen(false)}
-        onIngestSuccess={() => fetchTelemetry()}
+        activeJob={activeIngestJob}
+        onStartJob={handleStartIngestJob}
+        onDismissJob={handleDismissIngestJob}
+      />
+
+      {/* Floating Bottom-Right Background Ingestion Progress Pill */}
+      <IngestProgressPill
+        job={activeIngestJob}
+        isModalOpen={isIngestOpen}
+        onExpand={() => setIsIngestOpen(true)}
+        onDismiss={handleDismissIngestJob}
       />
 
       {/* Username / Authentication Modal */}

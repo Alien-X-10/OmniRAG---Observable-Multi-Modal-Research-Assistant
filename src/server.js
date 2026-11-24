@@ -1,19 +1,33 @@
 // File: src/server.js
+import { setDefaultResultOrder } from 'node:dns';
+import { setDefaultAutoSelectFamily } from 'node:net';
+setDefaultResultOrder('ipv4first');
+setDefaultAutoSelectFamily(false);
 import crypto from 'node:crypto';
 import express from 'express';
 import multer from 'multer';
 import dotenv from 'dotenv';
 import { generateGroundedAnswer } from './generation/generator.js';
+import { retrieveAndCompact } from './retrieval/compactor.js';
 import {
   telemetryMiddleware,
   recordQueryTelemetry,
   getTelemetrySummary,
 } from './middleware/telemetry.js';
 import { connectDB, closeDB, getChunksCollection } from './config/db.js';
-import { ingestVideo } from './ingestion/ytIngest.js';
-import { ingestPdf } from './ingestion/pdfIngest.js';
+
 import { registerUser, loginUser, requireAuth } from './services/auth.js';
 import path from 'node:path';
+
+import { ingestVideo } from './ingestion/ytIngest.js';
+import { ingestPdf } from './ingestion/pdfIngest.js';
+import {
+  startIngestJob,
+  getIngestJobForUser,
+  getActiveIngestJobsForUser,
+  subscribeToIngestJob,
+} from './services/ingestJobs.js';
+
 
 
 dotenv.config({ quiet: true });
@@ -30,8 +44,10 @@ const upload = multer({
 
 const frontendDistPath = path.resolve('omnirag-frontend/dist');
 app.use(express.static(frontendDistPath));
+
+
 /**
- * 1A. UI Endpoint for YouTube Ingestion (User-Scoped)
+ * 1A. UI Endpoint for Non-Blocking YouTube Ingestion (User-Scoped Background Job)
  */
 app.post('/api/ingest', requireAuth, async (req, res) => {
   try {
@@ -41,14 +57,18 @@ app.post('/api/ingest', requireAuth, async (req, res) => {
     }
 
     const userId = String(req.user.userId);
-    const result = await ingestVideo({ videoUrl, useMock: false, userId });
+    const job = startIngestJob({
+      userId,
+      type: 'youtube',
+      initialTitle: 'YouTube Lecture',
+      runner: (onProgress) =>
+        ingestVideo({ videoUrl, useMock: false, userId, onProgress }),
+    });
 
-    return res.json({
-      status: 'ok',
-      video_id: result.videoId,
-      title: `${result.title} (${result.chunksCount} chunks)`,
-      chunks_count: result.chunksCount,
-      chunksCount: result.chunksCount,
+    return res.status(202).json({
+      status: 'accepted',
+      jobId: job.jobId,
+      job,
     });
   } catch (err) {
     return res.status(500).json({ error: err.message });
@@ -56,7 +76,7 @@ app.post('/api/ingest', requireAuth, async (req, res) => {
 });
 
 /**
- * 1B. UI Endpoint for Multi-Modal PDF & Slide-Deck Ingestion (User-Scoped)
+ * 1B. UI Endpoint for Non-Blocking PDF & Slide-Deck Ingestion (User-Scoped Background Job)
  */
 app.post('/api/ingest/pdf', requireAuth, upload.single('file'), async (req, res) => {
   try {
@@ -65,24 +85,91 @@ app.post('/api/ingest/pdf', requireAuth, upload.single('file'), async (req, res)
     }
 
     const userId = String(req.user.userId);
-    const result = await ingestPdf({
-      fileBuffer: req.file.buffer,
-      originalName: req.file.originalname || 'Document.pdf',
-      customTitle: req.body?.title || null,
-      useMock: false,
+    const fileBuffer = req.file.buffer;
+    const originalName = req.file.originalname || 'Document.pdf';
+    const customTitle = req.body?.title || null;
+
+    const job = startIngestJob({
       userId,
+      type: 'pdf',
+      initialTitle: customTitle?.trim() || originalName,
+      runner: (onProgress) =>
+        ingestPdf({
+          fileBuffer,
+          originalName,
+          customTitle,
+          useMock: false,
+          userId,
+          onProgress,
+        }),
     });
 
-    return res.json({
-      status: 'ok',
-      video_id: result.videoId,
-      title: result.title,
-      chunks_count: result.chunksCount,
-      chunksCount: result.chunksCount,
+    return res.status(202).json({
+      status: 'accepted',
+      jobId: job.jobId,
+      job,
     });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
+});
+
+/**
+ * 1C. Lists Active Background Ingestion Jobs for the Logged-In User (Refresh Recovery)
+ */
+app.get('/api/ingest/jobs/active', requireAuth, (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  const userId = String(req.user.userId);
+  return res.status(200).json({ jobs: getActiveIngestJobsForUser(userId) });
+});
+
+/**
+ * 1D. SSE Stream for Live Ingestion Progress, Chunk Counters & Quota Cooldowns
+ */
+app.get('/api/ingest/jobs/:jobId/stream', requireAuth, (req, res) => {
+  const userId = String(req.user.userId);
+  const entry = getIngestJobForUser(req.params.jobId, userId);
+
+  if (!entry) {
+    return res.status(404).json({ error: 'Ingestion job not found.' });
+  }
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+
+  // Send immediate snapshot so a reconnecting browser sees current progress right away
+  if (entry.job.status === 'completed') {
+    sendSseEvent(res, 'complete', entry.job);
+    return res.end();
+  }
+  if (entry.job.status === 'failed') {
+    sendSseEvent(res, 'error', entry.job);
+    return res.end();
+  }
+
+  sendSseEvent(res, 'progress', entry.job);
+
+  // Keep SSE stream alive through 62s Free Tier cooldowns on hotspots/proxies
+  const heartbeat = setInterval(() => {
+    res.write(': ping\n\n');
+  }, 15000);
+
+  const unsubscribe = subscribeToIngestJob(entry, (eventName, snapshot) => {
+    sendSseEvent(res, eventName, snapshot);
+    if (eventName === 'complete' || eventName === 'error') {
+      clearInterval(heartbeat);
+      unsubscribe();
+      res.end();
+    }
+  });
+
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    unsubscribe();
+  });
 });
 
 /**
@@ -152,6 +239,45 @@ app.post('/api/query/stream', requireAuth, async (req, res) => {
     res.end();
   }
 });
+
+
+/**
+ * 3B. Voice Retrieval Endpoint (User-Scoped Hybrid RRF + Cross-Encoder + Compactor)
+ */
+app.post('/api/retrieval/search', requireAuth, async (req, res) => {
+  try {
+    const { query, topK = 5 } = req.body || {};
+    if (!query || typeof query !== 'string' || !query.trim()) {
+      return res.status(400).json({ error: 'A non-empty "query" string is required.' });
+    }
+
+    const userId = req.user?.userId ? String(req.user.userId) : null;
+    const boundedTopK = Math.max(1, Math.min(Number(topK) || 5, 10));
+
+    const result = await retrieveAndCompact(query.trim(), boundedTopK, userId);
+
+    const passages = (result.survivingChunks || []).map((c) => ({
+      chunk_id: c.chunk_id,
+      video_id: c.video_metadata?.video_id || '',
+      title: c.video_metadata?.title || 'Untitled Source',
+      url: c.video_metadata?.url || '',
+      timestamp: c.time_bounds?.display_timestamp || '00:00',
+      cross_encoder_score: Number((c.cross_encoder_score ?? 0).toFixed(3)),
+      rrf_score: Number((c.rrf_score ?? 0).toFixed(6)),
+      text: c.compacted_content || c.content || '',
+    }));
+
+    return res.status(200).json({
+      query: result.query,
+      passages,
+      telemetry: result.telemetry,
+    });
+  } catch (err) {
+    console.error('[Retrieval Search Error]:', err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 
 /**
  * 4. Observability Dashboard Endpoint

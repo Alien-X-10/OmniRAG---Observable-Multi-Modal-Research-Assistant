@@ -14,9 +14,14 @@ const ai = new GoogleGenAI({
   httpOptions: { apiVersion: 'v1beta' },
 });
 
-// const GENERATION_MODEL = 'gemini-2.5-flash';
-// const GENERATION_MODEL = 'gemini-3.1-flash-lite';
-const GENERATION_MODEL = process.env.GENERATION_MODEL || 'gemini-3.1-flash-lite';
+const GENERATION_MODELS = [
+  ...new Set([
+    process.env.GENERATION_MODEL || 'gemini-3.1-flash-lite',
+    'gemini-3.5-flash-lite',
+    'gemini-3.1-flash-lite',
+    'gemini-2.5-flash',
+  ]),
+];
 
 // Gemini 2.5 Flash reference pricing per 1M tokens (for observability cost tracking)
 const COST_PER_1M_INPUT_USD = 0.15;
@@ -33,6 +38,21 @@ STRICT GROUNDING & CITATION RULES:
 5. ABSTENTION PATH: If the provided <chunk> blocks are empty or do not explicitly contain the factual answer to the user's question, you MUST set "is_abstained": true, "answer": null, and "citations": [].`;
 
 /**
+ * Detects temporary Gemini API high-demand / 503 availability spikes.
+ */
+function isRetryable503(err) {
+  const status = err?.status ?? err?.code;
+  const msg = String(err?.message || '');
+  return (
+    status === 503 ||
+    msg.includes('503') ||
+    msg.includes('UNAVAILABLE') ||
+    msg.toLowerCase().includes('high demand') ||
+    msg.toLowerCase().includes('overloaded')
+  );
+}
+
+/**
  * Calculates estimated inference cost in USD from token counts.
  */
 function calculateCostUsd(promptTokens, candidateTokens) {
@@ -42,7 +62,7 @@ function calculateCostUsd(promptTokens, candidateTokens) {
 }
 
 /**
- * End-to-End Grounded RAG Generator with Streaming & TTFT Telemetry
+ * End-to-End Grounded RAG Generator with Streaming, 503 Model Fallback & TTFT Telemetry
  *
  * @param {string} query - The user's technical question
  * @param {object} options
@@ -81,7 +101,7 @@ export async function generateGroundedAnswer(
       query,
       output: abstainedPayload,
       telemetry: {
-        model: GENERATION_MODEL,
+        model: GENERATION_MODELS[0],
         abstainedByGate: true,
         retrievalLatencyMs,
         ttftMs: 0,
@@ -96,11 +116,13 @@ export async function generateGroundedAnswer(
     };
   }
 
-  // 3. Stream Grounded JSON Response from Gemini
-  const genStartMs = performance.now();
+  // 3. Stream Grounded JSON Response from Gemini (with Automatic 503 Fallback)
+  let genStartMs = performance.now();
   let ttftMs = null;
   let accumulatedJsonText = '';
   let usageMetadata = null;
+  let activeModel = GENERATION_MODELS[0];
+  let lastStreamErr = null;
 
   const prompt = `User Question: "${query}"
 
@@ -109,33 +131,60 @@ ${retrievalResult.formattedContext}
 
 Generate the strictly grounded JSON response following the required schema.`;
 
-  const responseStream = await ai.models.generateContentStream({
-    model: GENERATION_MODEL,
-    contents: [{ role: 'user', parts: [{ text: prompt }] }],
-    config: {
-      systemInstruction: SYSTEM_INSTRUCTION,
-      temperature: 0.0,
-      responseMimeType: 'application/json',
-      responseSchema: RAG_RESPONSE_SCHEMA,
-    },
-  });
+  for (let i = 0; i < GENERATION_MODELS.length; i++) {
+    const modelName = GENERATION_MODELS[i];
+    activeModel = modelName;
+    genStartMs = performance.now();
+    ttftMs = null;
+    usageMetadata = null;
 
-  for await (const chunk of responseStream) {
-    if (ttftMs === null) {
-      ttftMs = Math.round(performance.now() - genStartMs);
-    }
+    try {
+      const responseStream = await ai.models.generateContentStream({
+        model: modelName,
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        config: {
+          systemInstruction: SYSTEM_INSTRUCTION,
+          temperature: 0.0,
+          responseMimeType: 'application/json',
+          responseSchema: RAG_RESPONSE_SCHEMA,
+        },
+      });
 
-    const deltaText = chunk.text || '';
-    if (deltaText) {
-      accumulatedJsonText += deltaText;
-      if (onStreamDelta) {
-        onStreamDelta(deltaText);
+      for await (const chunk of responseStream) {
+        if (ttftMs === null) {
+          ttftMs = Math.round(performance.now() - genStartMs);
+        }
+
+        const deltaText = chunk.text || '';
+        if (deltaText) {
+          accumulatedJsonText += deltaText;
+          if (onStreamDelta) {
+            onStreamDelta(deltaText);
+          }
+        }
+
+        if (chunk.usageMetadata) {
+          usageMetadata = chunk.usageMetadata;
+        }
       }
-    }
 
-    if (chunk.usageMetadata) {
-      usageMetadata = chunk.usageMetadata;
+      lastStreamErr = null;
+      break;
+    } catch (err) {
+      lastStreamErr = err;
+      const hasFallback = i < GENERATION_MODELS.length - 1;
+      if (!isRetryable503(err) || !hasFallback || accumulatedJsonText.length > 0) {
+        throw err;
+      }
+      console.warn(
+        `[Generator] ${modelName} returned 503 high demand; falling back to ${GENERATION_MODELS[i + 1]}...`
+      );
+      await new Promise((r) => setTimeout(r, 600));
     }
+  }
+
+  if (lastStreamErr) {
+    throw lastStreamErr;
   }
 
   const generationLatencyMs = Math.round(performance.now() - genStartMs);
@@ -153,7 +202,7 @@ Generate the strictly grounded JSON response following the required schema.`;
     query,
     output: parsedOutput,
     telemetry: {
-      model: GENERATION_MODEL,
+      model: activeModel,
       abstainedByGate: false,
       retrievalLatencyMs,
       ttftMs: ttftMs ?? generationLatencyMs,

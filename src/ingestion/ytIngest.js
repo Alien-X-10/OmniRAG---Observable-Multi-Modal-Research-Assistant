@@ -24,6 +24,11 @@ const ai = new GoogleGenAI({
   httpOptions: { apiVersion: 'v1beta' },
 });
 
+const BATCH_EMBEDDING_MODEL = 'gemini-embedding-001';
+const MAX_TOKENS_PER_BATCH = 22000; // Safely below Free Tier 30,000 TPM cap
+const MAX_CHUNKS_PER_BATCH = 80;    // Safely below Free Tier 100 RPM item cap
+const RATE_WINDOW_RESET_MS = 62000; // 62s cooldown between batches on multi-hour videos
+
 const BROWSER_USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0';
 
@@ -98,7 +103,7 @@ function parseTimestampString(tsStr) {
  * Rough token estimator (~4 chars per token) for context window budgeting.
  */
 function estimateTokens(text) {
-  return Math.ceil(text.trim().length / 4);
+  return Math.ceil(String(text || '').trim().length / 4);
 }
 
 /**
@@ -489,8 +494,6 @@ async function fetchTranscriptViaInnerTube(
 
 /**
  * Tier 2: Single-Pass yt-dlp Extractor with --ignore-errors and ANDROID_VR/IOS client rotation.
- * Even if YouTube returns 429 on a secondary language track, --ignore-errors preserves any
- * subtitle file that succeeded.
  */
 async function fetchTranscriptViaSinglePassYtDlp(
   videoId,
@@ -586,9 +589,6 @@ async function fetchTranscriptViaSinglePassYtDlp(
 
 /**
  * Tier 3 Guaranteed Fallback: Duration-Calibrated Plain-Line Gemini 2.5 Flash Extractor.
- * - Uses plain "[mm:ss] text" lines instead of JSON so JSON.parse() can NEVER fail.
- * - Uses explicit colon timestamps ("mm:ss" / "hh:mm:ss") calibrated against the video's
- *   real durationSeconds so a 34-minute video ALWAYS spans 00:00 -> 34:00 (~30+ chunks).
  */
 async function fetchTranscriptViaGemini(videoId, canonicalUrl, preloadedMeta) {
   const { title, durationSeconds } = preloadedMeta;
@@ -690,7 +690,6 @@ STRICT OUTPUT FORMAT RULES:
     maxParsedSecond > 0 &&
     maxParsedSecond < durationSeconds * 0.25
   ) {
-    // If the model emitted minute floats parsed as small seconds, scale across true durationSeconds
     const scaleFactor = (durationSeconds - 30) / maxParsedSecond;
     for (const seg of parsedSegments) {
       seg.startSeconds = Math.floor(seg.startSeconds * scaleFactor);
@@ -715,11 +714,7 @@ STRICT OUTPUT FORMAT RULES:
 }
 
 /**
- * Multi-tier fault-tolerant YouTube transcript pipeline:
- * 1. Fast metadata lookup (title + exact durationSeconds)
- * 2. Direct InnerTube Multi-Client (Watch Page / ANDROID_VR / IOS)
- * 3. Single-pass yt-dlp with --ignore-errors
- * 4. Plain-line Duration-Calibrated Gemini 2.5 Flash Fallback (Zero JSON errors, guaranteed full-duration chunks)
+ * Multi-tier fault-tolerant YouTube transcript pipeline.
  */
 async function fetchYoutubeTranscript(videoUrl) {
   const videoId = extractVideoId(videoUrl);
@@ -751,9 +746,72 @@ async function fetchYoutubeTranscript(videoUrl) {
 }
 
 /**
- * Embeds a single chunk with automatic retry on transient network/rate blips.
+ * Extracts exact retry cooldown (in ms) from Gemini 429 RESOURCE_EXHAUSTED errors.
  */
-async function embedChunkWithRetry(content, title, retries = 3) {
+function getRateLimitWaitMs(err, attempt) {
+  const msg = String(err?.message || '');
+  const secondsMatch = msg.match(/retry in\s+([\d.]+)s/i);
+  if (secondsMatch) {
+    const parsedSec = parseFloat(secondsMatch[1]);
+    if (!Number.isNaN(parsedSec)) {
+      return Math.ceil(parsedSec * 1000) + 2000;
+    }
+  }
+
+  if (
+    msg.includes('429') ||
+    msg.includes('RESOURCE_EXHAUSTED') ||
+    msg.toLowerCase().includes('quota')
+  ) {
+    return RATE_WINDOW_RESET_MS;
+  }
+
+  return 1500 * attempt;
+}
+
+/**
+ * Groups chunks into batches staying safely under BOTH:
+ * - MAX_TOKENS_PER_BATCH (22,000 tokens -> below 30,000 TPM cap)
+ * - MAX_CHUNKS_PER_BATCH (80 chunks -> below 100 RPM item cap)
+ */
+function buildEmbeddingBatches(
+  chunks,
+  title,
+  maxTokens = MAX_TOKENS_PER_BATCH,
+  maxChunks = MAX_CHUNKS_PER_BATCH
+) {
+  const titleOverhead = estimateTokens(`Document: ${title}\n`) + 15;
+  const batches = [];
+  let currentBatch = [];
+  let currentTokens = 0;
+
+  for (const chunk of chunks) {
+    const chunkTokens = (chunk.tokenCount || estimateTokens(chunk.content)) + titleOverhead;
+
+    if (
+      currentBatch.length > 0 &&
+      (currentTokens + chunkTokens > maxTokens || currentBatch.length >= maxChunks)
+    ) {
+      batches.push({ chunks: currentBatch, estimatedTokens: currentTokens });
+      currentBatch = [];
+      currentTokens = 0;
+    }
+
+    currentBatch.push(chunk);
+    currentTokens += chunkTokens;
+  }
+
+  if (currentBatch.length > 0) {
+    batches.push({ chunks: currentBatch, estimatedTokens: currentTokens });
+  }
+
+  return batches;
+}
+
+/**
+ * Fallback single-chunk embedder with smart 429 cooldown parsing.
+ */
+async function embedChunkWithRetry(content, title, retries = 4) {
   let lastErr;
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
@@ -761,11 +819,67 @@ async function embedChunkWithRetry(content, title, retries = 3) {
     } catch (err) {
       lastErr = err;
       if (attempt < retries) {
-        await new Promise((r) => setTimeout(r, 800 * attempt));
+        const waitMs = getRateLimitWaitMs(err, attempt);
+        console.warn(
+          `[Ingest] Single-chunk embedding rate-limited (attempt ${attempt}/${retries}). Waiting ${(
+            waitMs / 1000
+          ).toFixed(1)}s...`
+        );
+        await new Promise((r) => setTimeout(r, waitMs));
       }
     }
   }
   throw lastErr;
+}
+
+/**
+ * Embeds a token- & count-budgeted batch of chunks in a SINGLE Gemini API request.
+ */
+async function embedChunksBatchWithRetry(chunks, title, retries = 4) {
+  const contentsWithTitle = chunks.map((c) => `Document: ${title}\n${c.content}`);
+
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const response = await ai.models.embedContent({
+        model: BATCH_EMBEDDING_MODEL,
+        contents: contentsWithTitle,
+        config: {
+          taskType: 'RETRIEVAL_DOCUMENT',
+        },
+      });
+
+      const embeddings = response?.embeddings || [];
+      if (embeddings.length !== chunks.length) {
+        throw new Error(
+          `Batch embedding count mismatch: expected ${chunks.length}, got ${embeddings.length}`
+        );
+      }
+
+      return embeddings.map((e, idx) => {
+        if (!e?.values || e.values.length === 0) {
+          throw new Error(`Empty embedding vector returned at batch index ${idx}`);
+        }
+        return e.values;
+      });
+    } catch (err) {
+      if (attempt < retries) {
+        const waitMs = getRateLimitWaitMs(err, attempt);
+        console.warn(
+          `[Ingest] Batch embedding transient/rate error (attempt ${attempt}/${retries}). Waiting ${(
+            waitMs / 1000
+          ).toFixed(1)}s...`
+        );
+        await new Promise((r) => setTimeout(r, waitMs));
+      } else {
+        console.warn('[Ingest] Falling back to paced individual chunk embedding...');
+        const fallbackVectors = [];
+        for (const c of chunks) {
+          fallbackVectors.push(await embedChunkWithRetry(c.content, title));
+        }
+        return fallbackVectors;
+      }
+    }
+  }
 }
 
 /**
@@ -792,11 +906,74 @@ function getMockLectureData() {
 }
 
 /**
- * Main Ingestion Runner (with 10x Faster Parallel Batch Embedding & Clean Video Upsert)
+ * Main Ingestion Runner (Token- & Count-Budgeted Batch Embedding + Per-User Isolation)
  */
-export async function ingestVideo({ videoUrl, useMock = false, userId = 'system' }) {
+/**
+ * Retries transient MongoDB Atlas network/socket timeouts on a fresh socket.
+ */
+async function withMongoRetry(operationName, fn, retries = 3) {
+  let lastErr;
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      const msg = String(err?.message || '');
+      const isNetworkErr =
+        err?.name?.includes('MongoNetwork') ||
+        msg.includes('timed out') ||
+        msg.includes('ECONNRESET') ||
+        msg.includes('socket');
+
+      if (!isNetworkErr || attempt === retries) {
+        throw err;
+      }
+      console.warn(
+        `[Ingest] MongoDB ${operationName} timed out (attempt ${attempt}/${retries}); retrying on fresh socket...`
+      );
+      await new Promise((r) => setTimeout(r, 1500 * attempt));
+    }
+  }
+  throw lastErr;
+}
+
+/**
+ * Main Ingestion Runner (Token- & Count-Budgeted Batch Embedding + Sliced MongoDB Writes)
+ */
+/**
+ * Main Ingestion Runner (Token- & Count-Budgeted Batch Embedding + Sliced MongoDB Writes + Live Progress)
+ */
+export async function ingestVideo({
+  videoUrl,
+  useMock = false,
+  userId = 'system',
+  onProgress = null,
+}) {
   const ownerId = String(userId || 'system');
-  await ensureStandardIndexes();
+  const report = (payload) => {
+    if (typeof onProgress === 'function') {
+      try {
+        onProgress(payload);
+      } catch {
+        // Never interrupt ingestion if a progress subscriber disconnects
+      }
+    }
+  };
+
+  report({
+    stage: 'extracting',
+    title: useMock ? 'Seed Lecture (vid_72x)' : 'YouTube Lecture',
+    videoId: null,
+    percent: 5,
+    currentBatch: 0,
+    totalBatches: 0,
+    savedChunks: 0,
+    totalChunks: 0,
+    cooldownEndsAt: null,
+    message: 'Extracting YouTube transcript & metadata...',
+  });
+
+  await withMongoRetry('ensureStandardIndexes', () => ensureStandardIndexes());
   const collection = await getChunksCollection();
 
   console.log(
@@ -810,61 +987,156 @@ export async function ingestVideo({ videoUrl, useMock = false, userId = 'system'
     : await fetchYoutubeTranscript(videoUrl);
 
   const rawChunks = buildTimeWindowChunks(segments, 80, 18);
+  const batches = buildEmbeddingBatches(rawChunks, title);
+  const totalChunks = Math.max(1, rawChunks.length);
+
   console.log(
-    `[Ingest] Created ${rawChunks.length} time-bounded chunks for "${title}".`
+    `[Ingest] Created ${rawChunks.length} time-bounded chunks for "${title}" (${batches.length} embedding batch(es)).`
   );
 
-  const operations = [];
-  const EMBED_BATCH_SIZE = 10;
+  report({
+    stage: 'chunking',
+    title,
+    videoId,
+    percent: 12,
+    currentBatch: 0,
+    totalBatches: batches.length,
+    savedChunks: 0,
+    totalChunks: rawChunks.length,
+    cooldownEndsAt: null,
+    message: `Prepared ${rawChunks.length} chunks across ${batches.length} batch(es).`,
+  });
 
-  // Embed in parallel batches of 10 for 8x-10x faster ingestion speed
-  for (let i = 0; i < rawChunks.length; i += EMBED_BATCH_SIZE) {
-    const batch = rawChunks.slice(i, i + EMBED_BATCH_SIZE);
+  const WRITE_SLICE_SIZE = 20;
+  let totalMatched = 0;
+  let totalUpserted = 0;
+  let savedChunks = 0;
 
-    const batchDocs = await Promise.all(
-      batch.map(async (chunk) => {
-        const embedding = await embedChunkWithRetry(chunk.content, title);
-        return createVectorChunkDocument({
-          userId: ownerId,
-          videoId,
-          title,
-          url,
-          startSeconds: chunk.startSeconds,
-          endSeconds: chunk.endSeconds,
-          displayTimestamp: chunk.displayTimestamp,
-          content: chunk.content,
-          embedding,
-          tokenCount: chunk.tokenCount,
-        });
-      })
+  for (let b = 0; b < batches.length; b++) {
+    const { chunks: batchChunks, estimatedTokens } = batches[b];
+    const batchNum = b + 1;
+
+    console.log(
+      `[Ingest] Sending batch ${batchNum}/${batches.length} (${batchChunks.length} chunks, ~${estimatedTokens} tokens) to ${BATCH_EMBEDDING_MODEL}...`
     );
 
-    for (const validatedDoc of batchDocs) {
-      operations.push({
+    report({
+      stage: 'embedding',
+      title,
+      videoId,
+      percent: Math.min(92, 12 + Math.round((savedChunks / totalChunks) * 82)),
+      currentBatch: batchNum,
+      totalBatches: batches.length,
+      savedChunks,
+      totalChunks: rawChunks.length,
+      cooldownEndsAt: null,
+      message: `Embedding Batch ${batchNum}/${batches.length} (${batchChunks.length} chunks)...`,
+    });
+
+    const vectors = await embedChunksBatchWithRetry(batchChunks, title);
+
+    const batchOperations = batchChunks.map((chunk, j) => {
+      const validatedDoc = createVectorChunkDocument({
+        userId: ownerId,
+        videoId,
+        title,
+        url,
+        startSeconds: chunk.startSeconds,
+        endSeconds: chunk.endSeconds,
+        displayTimestamp: chunk.displayTimestamp,
+        content: chunk.content,
+        embedding: vectors[j],
+        tokenCount: chunk.tokenCount,
+      });
+
+      return {
         updateOne: {
           filter: { user_id: ownerId, chunk_id: validatedDoc.chunk_id },
           update: { $set: validatedDoc },
           upsert: true,
         },
-      });
-      console.log(
-        `[Ingest] Embedded & validated chunk: ${validatedDoc.chunk_id}`
+      };
+    });
+
+    // Clear stale chunks for this user & videoId once right before saving Batch 1
+    if (b === 0) {
+      await withMongoRetry('deleteMany', () =>
+        collection.deleteMany({
+          user_id: ownerId,
+          'video_metadata.video_id': videoId,
+        })
       );
+    }
+
+    // Write in small 20-chunk slices (~600 KB) so hotspot sockets never time out
+    for (let s = 0; s < batchOperations.length; s += WRITE_SLICE_SIZE) {
+      const slice = batchOperations.slice(s, s + WRITE_SLICE_SIZE);
+      const res = await withMongoRetry(
+        `bulkWrite batch ${batchNum} (${s + 1}-${s + slice.length})`,
+        () => collection.bulkWrite(slice, { ordered: false })
+      );
+      totalMatched += res.matchedCount || 0;
+      totalUpserted += res.upsertedCount || 0;
+      savedChunks += slice.length;
+
+      report({
+        stage: 'saving',
+        title,
+        videoId,
+        percent: Math.min(97, 12 + Math.round((savedChunks / totalChunks) * 85)),
+        currentBatch: batchNum,
+        totalBatches: batches.length,
+        savedChunks,
+        totalChunks: rawChunks.length,
+        cooldownEndsAt: null,
+        message: `Batch ${batchNum}/${batches.length} · ${savedChunks} / ${rawChunks.length} chunks saved`,
+      });
+    }
+
+    console.log(
+      `[Ingest] Batch ${batchNum}/${batches.length} embedded & saved to MongoDB (${batchChunks.length} chunks).`
+    );
+
+    // Pace multi-batch videos across Free Tier per-minute quota windows
+    if (b < batches.length - 1) {
+      const cooldownEndsAt = Date.now() + RATE_WINDOW_RESET_MS;
+      console.log(
+        `[Ingest] Waiting ${RATE_WINDOW_RESET_MS / 1000}s for Gemini Free Tier quota window reset before batch ${batchNum + 1}/${batches.length}...`
+      );
+
+      report({
+        stage: 'cooldown',
+        title,
+        videoId,
+        percent: Math.min(97, 12 + Math.round((savedChunks / totalChunks) * 85)),
+        currentBatch: batchNum,
+        totalBatches: batches.length,
+        savedChunks,
+        totalChunks: rawChunks.length,
+        cooldownEndsAt,
+        message: `Batch ${batchNum}/${batches.length} · ${savedChunks} / ${rawChunks.length} chunks saved`,
+      });
+
+      await new Promise((r) => setTimeout(r, RATE_WINDOW_RESET_MS));
     }
   }
 
-  if (operations.length > 0) {
-    // Remove any stale/partial chunks for this user & videoId before writing the fresh set
-    await collection.deleteMany({
-      user_id: ownerId,
-      'video_metadata.video_id': videoId,
-    });
+  console.log(
+    `[Ingest] Upsert complete in ${batches.length} embedding API call(s) -> Matched: ${totalMatched}, Upserted: ${totalUpserted}`
+  );
 
-    const result = await collection.bulkWrite(operations);
-    console.log(
-      `[Ingest] Upsert complete -> Matched: ${result.matchedCount}, Upserted: ${result.upsertedCount}`
-    );
-  }
+  report({
+    stage: 'completed',
+    title,
+    videoId,
+    percent: 100,
+    currentBatch: batches.length,
+    totalBatches: batches.length,
+    savedChunks: rawChunks.length,
+    totalChunks: rawChunks.length,
+    cooldownEndsAt: null,
+    message: `Indexed "${title}" (${rawChunks.length} chunks).`,
+  });
 
   return { videoId, title, chunksCount: rawChunks.length };
 }

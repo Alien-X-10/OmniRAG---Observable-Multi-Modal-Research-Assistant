@@ -13,9 +13,14 @@ const ai = new GoogleGenAI({
   httpOptions: { apiVersion: 'v1beta' },
 });
 
-// const RERANK_MODEL = 'gemini-2.5-flash';
-// const RERANK_MODEL = 'gemini-3.1-flash-lite';
-const RERANK_MODEL = process.env.GENERATION_MODEL || 'gemini-3.1-flash-lite';
+const RERANK_MODELS = [
+  ...new Set([
+    process.env.GENERATION_MODEL || 'gemini-3.5-flash-lite',
+    'gemini-3.1-flash-lite',
+    'gemini-3.1-flash-lite',
+    'gemini-2.5-flash',
+  ]),
+];
 const RELEVANCE_THRESHOLD = 0.5;
 
 // Common spoken-lecture filler phrases & transitions safe to strip without losing technical facts
@@ -25,6 +30,21 @@ const SPOKEN_FILLER_PATTERNS = [
   /\b(so,?\s+as\s+you\s+can\s+see,?|now,?\s+let's\s+talk\s+about|moving\s+on\s+to)\b\s*/gi,
   /\b(in\s+order\s+to)\b/gi,
 ];
+
+/**
+ * Detects temporary Gemini API high-demand / 503 availability spikes.
+ */
+function isRetryable503(err) {
+  const status = err?.status ?? err?.code;
+  const msg = String(err?.message || '');
+  return (
+    status === 503 ||
+    msg.includes('503') ||
+    msg.includes('UNAVAILABLE') ||
+    msg.toLowerCase().includes('high demand') ||
+    msg.toLowerCase().includes('overloaded')
+  );
+}
 
 /**
  * Rough token estimator (~4 chars per token)
@@ -64,7 +84,7 @@ export function compactChunkText(rawText) {
 }
 
 /**
- * 2. Cross-Encoder Re-Ranker
+ * 2. Cross-Encoder Re-Ranker (with Automatic 503 Model Fallback)
  * Evaluates exact semantic alignment between the user query and all RRF candidate chunks
  * in a single batched pass, returning relevance scores on a [0.0, 1.0] scale.
  */
@@ -78,14 +98,20 @@ export async function crossEncodeRerank(query, candidateChunks) {
     content: c.content,
   }));
 
-  const response = await ai.models.generateContent({
-    model: RERANK_MODEL,
-    contents: [
-      {
-        role: 'user',
-        parts: [
+  let response = null;
+  let lastErr = null;
+
+  for (let i = 0; i < RERANK_MODELS.length; i++) {
+    const modelName = RERANK_MODELS[i];
+    try {
+      response = await ai.models.generateContent({
+        model: modelName,
+        contents: [
           {
-            text: `You are a strict Cross-Encoder relevance judge for a technical RAG pipeline.
+            role: 'user',
+            parts: [
+              {
+                text: `You are a strict Cross-Encoder relevance judge for a technical RAG pipeline.
 Score each candidate chunk from 0.0 to 1.0 based ONLY on whether the chunk explicitly contains facts that help answer the user query.
 - Score 0.8 to 1.0: Directly answers the query with specific technical facts.
 - Score 0.5 to 0.79: Partially answers or provides necessary technical context.
@@ -95,32 +121,49 @@ User Query: "${query}"
 
 Candidate Chunks:
 ${JSON.stringify(promptPayload, null, 2)}`,
+              },
+            ],
           },
         ],
-      },
-    ],
-    config: {
-      temperature: 0.0,
-      responseMimeType: 'application/json',
-      responseSchema: {
-        type: Type.OBJECT,
-        properties: {
-          scores: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                chunk_id: { type: Type.STRING },
-                relevance_score: { type: Type.NUMBER },
+        config: {
+          temperature: 0.0,
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              scores: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    chunk_id: { type: Type.STRING },
+                    relevance_score: { type: Type.NUMBER },
+                  },
+                  required: ['chunk_id', 'relevance_score'],
+                },
               },
-              required: ['chunk_id', 'relevance_score'],
             },
+            required: ['scores'],
           },
         },
-        required: ['scores'],
-      },
-    },
-  });
+      });
+      break;
+    } catch (err) {
+      lastErr = err;
+      const hasFallback = i < RERANK_MODELS.length - 1;
+      if (!isRetryable503(err) || !hasFallback) {
+        throw err;
+      }
+      console.warn(
+        `[Cross-Encoder] ${modelName} returned 503 high demand; falling back to ${RERANK_MODELS[i + 1]}...`
+      );
+      await new Promise((r) => setTimeout(r, 600));
+    }
+  }
+
+  if (!response) {
+    throw lastErr;
+  }
 
   const parsed = JSON.parse(response.text);
   const scoreMap = new Map(

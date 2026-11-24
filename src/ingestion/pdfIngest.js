@@ -270,6 +270,38 @@ function getMockPdfData() {
 /**
  * Main PDF Ingestion Pipeline
  */
+/**
+ * Retries transient MongoDB Atlas network/socket timeouts on a fresh socket.
+ */
+async function withMongoRetryPdf(operationName, fn, retries = 3) {
+  let lastErr;
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      const msg = String(err?.message || '');
+      const isNetworkErr =
+        err?.name?.includes('MongoNetwork') ||
+        msg.includes('timed out') ||
+        msg.includes('ECONNRESET') ||
+        msg.includes('socket');
+
+      if (!isNetworkErr || attempt === retries) {
+        throw err;
+      }
+      console.warn(
+        `[PDF Ingest] MongoDB ${operationName} timed out (attempt ${attempt}/${retries}); retrying on fresh socket...`
+      );
+      await new Promise((r) => setTimeout(r, 1500 * attempt));
+    }
+  }
+  throw lastErr;
+}
+
+/**
+ * Main PDF Ingestion Pipeline (Token-Safe Batch Embedding + Sliced MongoDB Writes + Live Progress)
+ */
 export async function ingestPdf({
   filePath = null,
   fileBuffer = null,
@@ -277,9 +309,34 @@ export async function ingestPdf({
   customTitle = null,
   useMock = false,
   userId = 'system',
+  onProgress = null,
 } = {}) {
   const ownerId = String(userId || 'system');
-  await ensureStandardIndexes();
+  const report = (payload) => {
+    if (typeof onProgress === 'function') {
+      try {
+        onProgress(payload);
+      } catch {
+        // Never interrupt ingestion if a progress subscriber disconnects
+      }
+    }
+  };
+
+  const initialTitle = customTitle?.trim() || originalName || 'PDF Document';
+  report({
+    stage: 'extracting',
+    title: initialTitle,
+    videoId: null,
+    percent: 8,
+    currentBatch: 0,
+    totalBatches: 0,
+    savedChunks: 0,
+    totalChunks: 0,
+    cooldownEndsAt: null,
+    message: 'Extracting text, tables & diagrams via Gemini 2.5 Flash...',
+  });
+
+  await withMongoRetryPdf('ensureStandardIndexes', () => ensureStandardIndexes());
   const collection = await getChunksCollection();
 
   let docId;
@@ -320,30 +377,55 @@ export async function ingestPdf({
   });
 
   const batches = buildTokenBudgetBatches(preparedChunks, MAX_TOKENS_PER_BATCH);
+  const totalChunks = Math.max(1, preparedChunks.length);
+
   console.log(
-    `[PDF Ingest] Created ${preparedChunks.length} chunks across ${batches.length} token-safe batch(es) for "${title}" (owner: ${ownerId}).`
+    `[PDF Ingest] Created ${preparedChunks.length} chunks across ${batches.length} token-safe batch(es) for "${title}".`
   );
 
-  const operations = [];
+  report({
+    stage: 'chunking',
+    title,
+    videoId: docId,
+    percent: 25,
+    currentBatch: 0,
+    totalBatches: batches.length,
+    savedChunks: 0,
+    totalChunks: preparedChunks.length,
+    cooldownEndsAt: null,
+    message: `Prepared ${preparedChunks.length} page chunks across ${batches.length} batch(es).`,
+  });
+
+  const WRITE_SLICE_SIZE = 20;
+  let totalMatched = 0;
+  let totalUpserted = 0;
+  let savedChunks = 0;
 
   for (let bIdx = 0; bIdx < batches.length; bIdx++) {
-    if (bIdx > 0) {
-      console.log(
-        `[PDF Ingest] Pausing 62s before batch #${bIdx + 1}/${batches.length} so Free Tier 30k TPM window resets...`
-      );
-      await new Promise((r) => setTimeout(r, TPM_WINDOW_RESET_MS));
-    }
-
     const batch = batches[bIdx];
+    const batchNum = bIdx + 1;
     const batchTokens = batch.reduce((sum, c) => sum + c.tokenCount, 0);
+
     console.log(
-      `[PDF Ingest] Embedding batch #${bIdx + 1}/${batches.length} (${batch.length} chunks, ~${batchTokens} tokens)...`
+      `[PDF Ingest] Embedding batch #${batchNum}/${batches.length} (${batch.length} chunks, ~${batchTokens} tokens)...`
     );
+
+    report({
+      stage: 'embedding',
+      title,
+      videoId: docId,
+      percent: Math.min(92, 25 + Math.round((savedChunks / totalChunks) * 70)),
+      currentBatch: batchNum,
+      totalBatches: batches.length,
+      savedChunks,
+      totalChunks: preparedChunks.length,
+      cooldownEndsAt: null,
+      message: `Embedding Batch ${batchNum}/${batches.length} (${batch.length} chunks)...`,
+    });
 
     const vectors = await embedChunksBatchWithRetry(batch, title);
 
-    for (let j = 0; j < batch.length; j++) {
-      const chunk = batch[j];
+    const batchOperations = batch.map((chunk, j) => {
       const validatedDoc = createVectorChunkDocument({
         userId: ownerId,
         videoId: docId,
@@ -357,26 +439,87 @@ export async function ingestPdf({
         tokenCount: chunk.tokenCount,
       });
 
-      operations.push({
+      return {
         updateOne: {
           filter: { user_id: ownerId, chunk_id: validatedDoc.chunk_id },
           update: { $set: validatedDoc },
           upsert: true,
         },
+      };
+    });
+
+    if (bIdx === 0) {
+      await withMongoRetryPdf('deleteMany', () =>
+        collection.deleteMany({
+          user_id: ownerId,
+          'video_metadata.video_id': docId,
+        })
+      );
+    }
+
+    for (let s = 0; s < batchOperations.length; s += WRITE_SLICE_SIZE) {
+      const slice = batchOperations.slice(s, s + WRITE_SLICE_SIZE);
+      const res = await withMongoRetryPdf(
+        `bulkWrite batch ${batchNum} (${s + 1}-${s + slice.length})`,
+        () => collection.bulkWrite(slice, { ordered: false })
+      );
+      totalMatched += res.matchedCount || 0;
+      totalUpserted += res.upsertedCount || 0;
+      savedChunks += slice.length;
+
+      report({
+        stage: 'saving',
+        title,
+        videoId: docId,
+        percent: Math.min(97, 25 + Math.round((savedChunks / totalChunks) * 72)),
+        currentBatch: batchNum,
+        totalBatches: batches.length,
+        savedChunks,
+        totalChunks: preparedChunks.length,
+        cooldownEndsAt: null,
+        message: `Batch ${batchNum}/${batches.length} · ${savedChunks} / ${preparedChunks.length} chunks saved`,
       });
+    }
+
+    if (bIdx < batches.length - 1) {
+      const cooldownEndsAt = Date.now() + TPM_WINDOW_RESET_MS;
+      console.log(
+        `[PDF Ingest] Pausing ${TPM_WINDOW_RESET_MS / 1000}s before batch #${batchNum + 1}/${batches.length} so Free Tier 30k TPM window resets...`
+      );
+
+      report({
+        stage: 'cooldown',
+        title,
+        videoId: docId,
+        percent: Math.min(97, 25 + Math.round((savedChunks / totalChunks) * 72)),
+        currentBatch: batchNum,
+        totalBatches: batches.length,
+        savedChunks,
+        totalChunks: preparedChunks.length,
+        cooldownEndsAt,
+        message: `Batch ${batchNum}/${batches.length} · ${savedChunks} / ${preparedChunks.length} chunks saved`,
+      });
+
+      await new Promise((r) => setTimeout(r, TPM_WINDOW_RESET_MS));
     }
   }
 
-  if (operations.length > 0) {
-    await collection.deleteMany({
-      user_id: ownerId,
-      'video_metadata.video_id': docId,
-    });
-    const result = await collection.bulkWrite(operations);
-    console.log(
-      `[PDF Ingest] Upsert complete in ${batches.length} embedding API call(s) -> Matched: ${result.matchedCount}, Upserted: ${result.upsertedCount}`
-    );
-  }
+  console.log(
+    `[PDF Ingest] Upsert complete in ${batches.length} embedding API call(s) -> Matched: ${totalMatched}, Upserted: ${totalUpserted}`
+  );
+
+  report({
+    stage: 'completed',
+    title,
+    videoId: docId,
+    percent: 100,
+    currentBatch: batches.length,
+    totalBatches: batches.length,
+    savedChunks: preparedChunks.length,
+    totalChunks: preparedChunks.length,
+    cooldownEndsAt: null,
+    message: `Indexed "${title}" (${preparedChunks.length} chunks).`,
+  });
 
   return {
     videoId: docId,

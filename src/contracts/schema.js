@@ -163,5 +163,6 @@ export function createVectorChunkDocument({
     content,
     embedding,
     token_count: tokenCount,
+    created_at: new Date(),
   };
 }

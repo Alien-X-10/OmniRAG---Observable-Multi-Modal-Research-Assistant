@@ -1,12 +1,16 @@
 // File: src/config/db.js
 import dns from 'node:dns';
+import net from 'node:net';
 import { MongoClient } from 'mongodb';
 import dotenv from 'dotenv';
 
-// Force Google & Cloudflare DNS and prioritize IPv4 so Windows/ISP routers don't stall on SRV/IPv6 lookups
+// Force Google & Cloudflare DNS and IPv4 so Windows/mobile NAT routers don't stall
 dns.setServers(['8.8.8.8', '1.1.1.1']);
 if (typeof dns.setDefaultResultOrder === 'function') {
   dns.setDefaultResultOrder('ipv4first');
+}
+if (typeof net.setDefaultAutoSelectFamily === 'function') {
+  net.setDefaultAutoSelectFamily(false);
 }
 
 dotenv.config({ quiet: true });
@@ -23,7 +27,7 @@ let client = null;
 let dbInstance = null;
 
 /**
- * Connects to MongoDB Atlas using a singleton connection pool with IPv4 & retry resilience.
+ * Connects to MongoDB Atlas using an idle-safe IPv4 connection pool.
  */
 export async function connectDB(retries = 3) {
   if (dbInstance) {
@@ -35,11 +39,15 @@ export async function connectDB(retries = 3) {
     try {
       client = new MongoClient(uri, {
         maxPoolSize: 10,
-        minPoolSize: 1,
-        serverSelectionTimeoutMS: 30000,
-        connectTimeoutMS: 30000,
-        socketTimeoutMS: 45000,
-        family: 4, // Force IPv4 sockets to avoid Node v24 dual-stack handshake timeouts
+        minPoolSize: 0,              // Avoid holding idle sockets open across NAT drops
+        maxIdleTimeMS: 20000,        // Recycle idle sockets after 20s
+        heartbeatFrequencyMS: 10000, // Detect dropped connections faster
+        serverSelectionTimeoutMS: 20000,
+        connectTimeoutMS: 15000,
+        socketTimeoutMS: 20000,      // Fail fast instead of hanging 45s on a dead socket
+        retryReads: true,
+        retryWrites: true,
+        family: 4,                   // Force IPv4 sockets on Node v24
       });
 
       await client.connect();
@@ -73,17 +81,9 @@ export async function getChunksCollection() {
 }
 
 /**
- * Creates standard B-Tree indexes to guarantee idempotent upserts
- * and fast filtering by video_id.
+ * Creates per-user B-Tree compound indexes to guarantee tenant-isolated upserts
+ * and fast filtering by user_id and video_id.
  */
-// export async function ensureStandardIndexes() {
-//   const collection = await getChunksCollection();
-
-//   await collection.createIndex({ chunk_id: 1 }, { unique: true });
-//   await collection.createIndex({ 'video_metadata.video_id': 1 });
-
-//   console.log(`[MongoDB] Verified unique index on chunk_id in "${collectionName}"`);
-// }
 export async function ensureStandardIndexes() {
   const collection = await getChunksCollection();
 
